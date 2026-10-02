@@ -37,7 +37,7 @@ The quad starts in **true acro**: sticks command rotation rates, and centred sti
 
 The default tune is a punchy 6S quad: about 10:1 thrust-to-weight, roughly 200 km/h flat out, hovering at about 30% throttle, with a 2200 mAh pack. Thrust follows prop physics (proportional to motor speed squared). Tune it in F8 → Quad.
 
-When you launch, Rico stays where he's standing with a radio in his hand, and other players see the radio too. The quad sits on the ground a few steps in front of him, turned to face him.
+When you launch, Rico stands where he is with a radio in his hand, and the quad sits on the ground a few steps in front of him, facing him. **Once you arm, Rico's body becomes the drone's collision body:** see *Collision* below. When you exit FPV mode he's put back at the launch spot.
 
 ### RadioMaster / RC transmitter
 
@@ -73,13 +73,19 @@ The tests cover the physics, the autopilot and swarm behaviours, and the full se
 None of this has been run inside the game yet. It's built against the JC3MP API as used by published packages (freecam, chat and Survival Island), and tested against a mock of that API. Expect some first-run tuning:
 
 - **Camera orientation.** JC3MP takes camera rotation as Euler angles, and the sign conventions were inferred from existing freecam code. If rolling or pitching turns the picture the wrong way, flip it in F8 → Camera. You only need to do this once and it's saved.
-- **Collision.** JC3MP's script API has no raycast or physics query (confirmed against the `types-jcmp` definitions). The one engine raycast it exposes is the aim ray (`localPlayer.lookAt`). The mod uses it like this:
-  - Every frame where the aim ray lines up with the drone camera (within 3°, allowing for a frame or two of lag), the hit point becomes a solid point and a ground sample.
-  - The drone, and the wingmen, collide with solid points the way Rico's capsule does. They're pushed out and slide or bounce when slow, and crash above `crashSpeed`.
-  - In FPV you're almost always looking where you're about to fly, so walls, trees, rocks and ground ahead get mapped just before you reach them. Everything mapped stays solid for the rest of the session.
-  - Sea level, the launch spot and the places characters have stood are always solid.
+- **Collision.** JC3MP's script API has no raycast or physics query (confirmed against the `types-jcmp` definitions), and the game's aim ray doesn't follow a detached camera. The one thing the game *does* simulate for us is Rico, so he's used as the drone's collision body:
+  - Once the quad is armed, Rico (unfrozen and invulnerable) is moved along with it every frame. In FPV view he sits just behind the camera, out of shot. In chase or line-of-sight view he hangs below the quad.
+  - Next frame the mod reads back where the engine actually left him. If the engine pushed him sideways or up, or he stopped falling early, his capsule touched real geometry: terrain, a wall, a rock, a tree or a car.
+  - That contact becomes a surface plane. The quad slides or bounces off it like a character, and crashes above `crashSpeed`.
+  - Every contact is also remembered (ground samples and solid points), so wingmen, and you on later passes, collide with places you've already flown.
+  - A side effect: the world streams in around the drone wherever it goes.
 
-  **Press F9 while flying.** The `AIM RAY` line says whether the game's aim ray follows the drone camera in your build. If it says **NOT FOLLOWING**, try F8 → Camera → *Keep game controls on while flying (experimental)*. If it still doesn't follow, this API offers no other way to get collision, and drones will pass through anything that isn't sea, launch spot or footprint.
+  Limits:
+  - The read-back lags one frame, and in FPV Rico rides about 0.7 m behind the camera. A very fast hit can therefore poke the camera into a wall for a frame before the drone is pushed out or crashes.
+  - Very thin things (poles, branches) can be missed at high speed.
+  - Wingmen only collide with what has been learned.
+
+  F9 shows `RICO PROXY … contacts …`, which counts how often the game reported a contact.
 - **Damage scale.** Player health in JC3MP runs 0–800. Vehicle max health isn't exposed consistently, so vehicle damage is a fraction of `maxHealth`, falling back to 1000.
-- **Your character.** Rico stays frozen and invulnerable at the launch spot while you fly. If detail stops streaming in on very long flights, set `followDistance` in `config.js`; the server will then move him under the drone as you go, so he's no longer visible at the launch spot.
+- **Your character.** Rico stays frozen at the launch spot until you arm, then travels with the drone as its collision body (invulnerable). Other players see him following your drone. He's returned to the launch spot when you exit. `followDistance` in `config.js` is no longer needed; leave it at 0.
 - **The radio in Rico's hand.** It's attached to the `RIGHTHANDATTACH` bone. JC3MP doesn't expose animations, so Rico keeps his idle pose. The bone's axes aren't documented, so if the radio sits at an odd angle, adjust `FPV.TX_OFFSET` / `FPV.TX_ROT` in `src/client/model.js`.

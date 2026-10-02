@@ -163,20 +163,3 @@ test('world: nearby samples and footprints hold the quad up; sea elsewhere', () 
     assert.strictEqual(w.floorAt({ x: 100, y: 1041, z: 100 }).y, 1040, 'terrain survives a new flight');
 });
 
-test('world: aim-ray hits that follow the camera become solid; others are ignored', () => {
-    const w = new FPV.World(1024);
-    const cam = { pos: { x: 0, y: 1050, z: 0 }, fwd: { x: 1, y: 0, z: 0 } };
-    // Wall 20 m ahead, hit dead centre.
-    for (let i = 0; i < 60; i++) { w.probe([cam], { x: 20, y: 1050 + (i % 5) * 0.2 - 0.4, z: (i % 7) * 0.15 - 0.45 }); }
-    assert.ok(w.probeRatio() > 0.9);
-    assert.ok(w.solidCount > 10, 'solids ' + w.solidCount);
-    const c = w.collide({ x: 19.7, y: 1050.1, z: 0.1 }, 0.15);
-    assert.ok(c && c.normal.x < -0.5, 'contact pushes back towards the camera');
-    assert.strictEqual(w.collide({ x: 15, y: 1050, z: 0 }, 0.15), null, 'free space is free');
-    // A lookAt that does not follow our camera (e.g. Rico's own aim) is rejected.
-    const w2 = new FPV.World(1024);
-    for (let i = 0; i < 60; i++) { w2.probe([cam], { x: -5, y: 1048, z: 30 }); }
-    assert.strictEqual(w2.probeRatio(), 0);
-    assert.strictEqual(w2.solidCount, 0);
-    assert.ok(w2.lastOffDeg > 45, 'reports how far off it is: ' + w2.lastOffDeg);
-});

@@ -86,6 +86,7 @@ test('launch, arm, fly, relay to other players, land', () => {
 
 test('crashing into the sea, reset, chase / los views', () => {
     const { server, a } = setup();
+    a.engine.ground = 1000;   // open water under the flight path (below sea level)
     // Stand above the sea on a cliff edge: pad radius is small, so flying off it
     // and cutting throttle drops the quad into the water.
     a.ui('fpv/ui/cmd', 'toggle');
@@ -332,16 +333,7 @@ test('Rico stays where he launched and holds the radio; drone starts on the grou
     assert.ok(b.frame().byTexture[radioTex] >= 1, 'Bob sees the radio in Alice\'s hand');
     assert.strictEqual(ra.culling, false, 'culling off for double-sided faces');
 
-    // Fly far away: the character must not be moved.
-    a.key(87, true);
-    server.run(3);
-    a.key(87, false);
-    a.key(38, true);
-    server.run(15);
-    a.key(38, false);
-    assert.ok(osdOf(a).home > 200, 'flew ' + osdOf(a).home);
-    assert.deepStrictEqual({ x: a.player.position.x, y: a.player.position.y, z: a.player.position.z }, start, 'Rico did not move');
-    assert.strictEqual(a.lp.frozen, true);
+    assert.strictEqual(a.lp.frozen, true, 'Rico stands frozen until take-off');
 });
 
 test('the quad model is drawn with the textured 3D parts', () => {
@@ -354,42 +346,70 @@ test('the quad model is drawn with the textured 3D parts', () => {
         JSON.stringify(rb.byTexture));
 });
 
-test('collision: with an aim ray that follows the camera, the drone cannot fly through a wall', () => {
+
+// Heading the drone camera faces, from the game euler (yawSign -1, YXZ).
+function camForward(cam) {
+    const yaw = -cam.rotation.y;
+    return { x: -Math.sin(yaw), z: -Math.cos(yaw) };
+}
+
+test('Rico stands at launch until take-off, then carries collision; back at launch on exit', () => {
+    const { server, a } = setup();
+    const start = { x: a.player.position.x, y: a.player.position.y, z: a.player.position.z };
+    a.ui('fpv/ui/cmd', 'toggle');
+    server.run(0.5);
+    assert.strictEqual(a.lp.frozen, true, 'standing frozen before arming');
+    assert.deepStrictEqual({ x: a.player.position.x, y: a.player.position.y, z: a.player.position.z }, start);
+    sticks(a, 0);
+    a.ui('fpv/ui/cmd', 'arm');
+    sticks(a, 0.6);
+    server.run(1.5);
+    assert.strictEqual(a.lp.frozen, false, 'unfrozen to act as the collision body');
+    assert.ok(a.player.position.y > start.y + 5, 'Rico travels with the drone: ' + a.player.position.y);
+    assert.ok(osdOf(a).dbg.proxyOn);
+    a.ui('fpv/ui/cmd', 'toggle');
+    assert.deepStrictEqual({ x: a.player.position.x, y: a.player.position.y, z: a.player.position.z }, start, 'returned to launch');
+    assert.deepStrictEqual(a.errors, []);
+});
+
+test('collision via Rico: ground the mod knew nothing about stops a dive', () => {
+    const { server, a } = setup();
+    a.ui('fpv/ui/cmd', 'toggle');
+    sticks(a, 0);
+    a.ui('fpv/ui/cmd', 'arm');
+    // Climb and fly well clear of the launch pad, over "unknown" terrain at
+    // y=1050 (the mod's own map only knows the sea at 1024 out here).
+    sticks(a, 0.8, 0, 0.4);
+    server.run(4);
+    assert.ok(osdOf(a).home > 30, 'away from the pad: ' + osdOf(a).home);
+    // Cut the throttle and fall.
+    sticks(a, 0);
+    let minY = Infinity;
+    for (let i = 0; i < 80; i++) { server.run(0.1); minY = Math.min(minY, a.lp.camera.position.y); }
+    assert.ok(minY > 1049.5, 'never went through the ground: lowest camera y ' + minY.toFixed(2));
+    assert.ok(osdOf(a).dbg.proxyContacts > 0, 'contacts came from the game');
+    assert.notStrictEqual(osdOf(a).reason, 'WATER', 'did not fall to the sea');
+    assert.deepStrictEqual(a.errors, []);
+});
+
+test('collision via Rico: a wall stops the drone', () => {
     const { server, a } = setup({ defaults: true });
     a.ui('fpv/ui/settings', JSON.stringify({ mode: 'angle', altHold: true }));
     a.ui('fpv/ui/cmd', 'toggle');
-    server.run(0.2);
-    // A wall 60 m in front of the drone (it starts facing Rico, so "forward"
-    // is back past him). The fake lookAt raycasts the camera against it.
-    const cam = a.lp.camera;
-    const osd0 = osdOf(a);
-    let wall = null;
-    Object.defineProperty(a.lp, 'lookAt', { get: () => {
-        const p = cam.position;
-        if (!wall) { return new Vector3f(0, 0, 0); }
-        // forward from the game euler (yawSign -1, pitchSign -1, order YXZ)
-        const yaw = -cam.rotation.y, pitch = -cam.rotation.x;
-        const f = { x: -Math.sin(yaw) * Math.cos(pitch), y: Math.sin(pitch), z: -Math.cos(yaw) * Math.cos(pitch) };
-        const t = (wall.d - (p.x * wall.n.x + p.z * wall.n.z)) / (f.x * wall.n.x + f.z * wall.n.z);
-        if (!(t > 0) || t > 500) { return new Vector3f(0, 0, 0); }
-        return new Vector3f(p.x + f.x * t, p.y + f.y * t, p.z + f.z * t);
-    } });
     a.key(87, true);
-    server.run(2.5);
+    server.run(2);
     a.key(87, false);
-    // Wall plane perpendicular to the current heading, 60 m ahead.
-    const yaw = -cam.rotation.y;
-    const n = { x: -Math.sin(yaw), z: -Math.cos(yaw) };
+    server.run(1);
+    const cam = a.lp.camera;
+    const f = camForward(cam);
     const p = cam.position;
-    wall = { n: n, d: p.x * n.x + p.z * n.z + 60 };
+    a.engine.wall = { n: f, d: p.x * f.x + p.z * f.z + 40 };   // 40 m ahead
     a.key(38, true);
-    let crashed = false;
-    for (let i = 0; i < 100 && !crashed; i++) { server.run(0.1); crashed = osdOf(a).crashed; }
+    for (let i = 0; i < 80; i++) { server.run(0.1); }
     a.key(38, false);
-    const q = cam.position;
-    assert.ok(crashed, 'hit the wall');
-    assert.ok(q.x * n.x + q.z * n.z <= wall.d + 0.5, 'stopped at the wall, not behind it');
-    const d = osdOf(a).dbg;
-    assert.ok(d.probeRatio > 30 && d.solids > 0, JSON.stringify(d));
+    const q = a.lp.camera.position;
+    const past = q.x * f.x + q.z * f.z - a.engine.wall.d;
+    assert.ok(past < 0.2, 'stopped at the wall, overshoot ' + past.toFixed(2) + ' m');
+    assert.ok(osdOf(a).dbg.solids > 0, 'wall remembered for wingmen');
     assert.deepStrictEqual(a.errors, []);
 });

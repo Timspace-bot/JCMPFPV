@@ -68,7 +68,6 @@
             camera: { eulerOrder: 'YXZ', pitchSign: -1, yawSign: -1, rollSign: -1, fovDeg: 92, modelRotSign: 1 },
             mode: 'acro',
             altHold: false,
-            keepControls: false,
             view: 'fpv',
             input: {
                 device: 'auto',
@@ -132,7 +131,7 @@
     function pushSettings() {
         J.CallEvent('fpv/ui/settings', JSON.stringify({
             tune: S.tune, camera: S.camera, mode: S.mode, altHold: S.altHold, view: S.view,
-            kbStrength: S.input.kbStrength, keepControls: !!S.keepControls
+            kbStrength: S.input.kbStrength
         }));
     }
 
@@ -550,10 +549,10 @@
             'STICKS T ' + o.sticks.t.toFixed(2) + ' Y ' + o.sticks.y.toFixed(2) + ' P ' + o.sticks.p.toFixed(2) + ' R ' + o.sticks.r.toFixed(2),
             'PAD ' + (pad ? (pad.id || '?').slice(0, 40) + (padActive ? ' (active)' : ' (idle - move a stick)') : 'none') +
                 '   device ' + S.input.device,
-            'AIM RAY ' + (d.probeRatio >= 30 ? 'FOLLOWS CAMERA ' + d.probeRatio + '%' : 'NOT FOLLOWING CAMERA (' + (d.probeRatio || 0) + '%)') +
-                '   last hit ' + (d.probeDist >= 0 ? d.probeDist + 'm' : '-') + ' / ' + (d.probeOff >= 0 ? d.probeOff + ' deg off' : 'none') +
-                (d.keepControls ? '   [controls kept on]' : ''),
-            'COLLISION points ' + (d.solids || 0) + '   ground samples ' + (d.samples || 0) + '   matched hits ' + (d.probeOk || 0) +
+            'RICO PROXY ' + (d.proxyOn ? 'on' : 'standing (arm to start)') + '   frames ' + (d.proxyFrames || 0) +
+                '   contacts ' + (d.proxyContacts || 0) + '   lost ' + (d.proxyLost || 0) +
+                '   moved by game ' + (d.proxyDrift ? d.proxyDrift.join(', ') : '-') + '   planes ' + (d.proxyPlanes || 0),
+            'COLLISION points ' + (d.solids || 0) + '   ground samples ' + (d.samples || 0) +
                 '   floor ' + (d.floor !== undefined ? d.floor + 'm' : '?') + ' (' + (d.floorSrc || '?') + ')',
             'ARMED ' + o.armed + '   mode ' + o.mode + (o.altHold ? '+AH' : '') + '   motor ' + Math.round((o.motor || 0) * 100) + '%'
         ];
@@ -727,7 +726,6 @@
         $('cam-roll').checked = S.camera.rollSign === 1;
         $('cam-model').checked = S.camera.modelRotSign === -1;
         $('cam-order').value = S.camera.eulerOrder;
-        $('keep-controls').checked = !!S.keepControls;
         $('osd-ahi').checked = S.osd.ahi;
         $('osd-noise').checked = S.osd.noise;
         $('osd-sticks').checked = S.osd.sticks;
@@ -765,7 +763,6 @@
         $('cam-roll').addEventListener('change', function () { S.camera.rollSign = this.checked ? 1 : -1; changed(); });
         $('cam-model').addEventListener('change', function () { S.camera.modelRotSign = this.checked ? -1 : 1; changed(); });
         $('cam-order').addEventListener('change', function () { S.camera.eulerOrder = this.value; changed(); });
-        $('keep-controls').addEventListener('change', function () { S.keepControls = this.checked; changed(); });
         $('cam-reset').addEventListener('click', function () {
             const d = defaults().camera;
             S.camera.eulerOrder = d.eulerOrder; S.camera.pitchSign = d.pitchSign; S.camera.yawSign = d.yawSign;
@@ -942,8 +939,8 @@
             cap: 1500, batt: true, amps: 31, time: 83, noise: 0.15, probe: true,
             swarm: { n: 3, max: 5, mode: 'support', atk: 0, id: 2 }, banner: 'LINK > W2  AUTO-AIM',
             sticks: { t: 0.55, y: -0.2, p: 0.4, r: 0.15 }, src: 'keyboard', fps: 60,
-            dbg: { probeOk: 812, probeTries: 1400, samples: 655, floor: -3.2, floorSrc: 'map', pad: false,
-                probeRatio: 0, probeOff: 41.7, probeDist: 12.3, solids: 0, keepControls: false } };
+            dbg: { samples: 655, floor: -3.2, floorSrc: 'map', pad: false, solids: 214,
+                proxyOn: true, proxyFrames: 5400, proxyContacts: 318, proxyLost: 0, proxyDrift: [0, -0.01, 0], proxyPlanes: 1 } };
         S.osd.debug = /debug/.test(location.search);
         if (/menu/.test(location.search)) { setMenu(true); }
     }

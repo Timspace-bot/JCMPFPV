@@ -522,6 +522,27 @@ FPV.step = function (s, input, env, tune, dt) {
     return s;
 };
 
+// Keep the quad on the outside of a surface plane (point + outward normal),
+// e.g. one reported by the game's own physics. Slow contact slides and
+// bounces like a character against a wall; fast contact is a crash.
+// Returns true if the quad was touching the plane.
+FPV.planeContact = function (s, point, n, tune) {
+    const r = tune.collisionRadius;
+    const gap = FPV.dot(FPV.sub(s.pos, point), n) - r;
+    if (gap >= 0) { return false; }
+    s.pos = FPV.add(s.pos, FPV.scale(n, -gap));
+    const vn = FPV.dot(s.vel, n);
+    if (vn < 0) {
+        if (-vn > tune.crashSpeed && !s.crashed) {
+            FPV.crash(s, 'IMPACT');
+            s.events[s.events.length - 1].speed = -vn;
+        }
+        s.vel = FPV.scale(FPV.sub(s.vel, FPV.scale(n, vn * 1.3)), 0.92);
+    }
+    if (n.y > 0.7) { s.onGround = true; }
+    return true;
+};
+
 // Arming checks, mirroring a real flight controller. Returns '' on success or
 // the reason arming was refused.
 FPV.tryArm = function (s, input) {
@@ -552,19 +573,16 @@ FPV.cameraPose = function (s, tune) {
 
 // ===== world.js =====
 // ---------------------------------------------------------------------------
-// world.js - what the drone can collide with.
+// world.js - what the drone remembers about the world's surfaces.
 //
-// JC3MP's client API has no physics raycast, so the floor is built from:
+// JC3MP's scripting API has no physics query. Live collision comes from Rico's
+// body (see the collision proxy in client.js); everything it touches, and
+// everywhere a character has stood, is remembered here so that wingmen and
+// later flights collide with it too:
 //   * sea level (water = crash),
-//   * "pads": known-good ground points (the launch spot under your feet,
-//     crash sites),
-//   * surface samples from jcmp.localPlayer.lookAt - the game's own aim ray.
-//     While the camera is detached that ray *may* follow our camera; every
-//     sample is checked against the camera ray and discarded if it does not
-//     line up, so a game build where lookAt does not follow simply falls back
-//     to pads + sea level. In FPV you are almost always looking at the ground
-//     ahead of you, so the terrain you are about to fly over gets sampled
-//     before you get there.
+//   * pads: known ground at the launch spot / crash sites,
+//   * ground samples: a heightfield of 2 m cells (floor lookups search ~5 m),
+//   * solid points: wall/tree/building contacts, 0.35 m spheres.
 // ---------------------------------------------------------------------------
 
 FPV.World = function (seaLevel) {
@@ -575,18 +593,12 @@ FPV.World = function (seaLevel) {
     this.cellSize = 2.0;
     this.maxCells = 30000;
     this.searchCells = 2;     // floor lookups also consider samples up to 2 cells (~5 m) away
-    // Solid points: every surface the aim ray has hit (walls, trees, rocks,
-    // buildings, ground). The quad collides with them like a character does.
+    // Solid points: wall/tree/building contacts reported by the game's physics
+    // (see the Rico collision proxy in client.js). Quads collide with them.
     this.solids = {};         // "x:y:z" (1 m cells) -> [{x,y,z}, ...]
     this.solidCount = 0;
     this.maxSolids = 250000;
-    this.solidRadius = 0.35;  // each hit point acts as a small sphere
-    this.probeValid = false;  // did the last lookAt sample line up with our camera?
-    this.validSamples = 0;
-    this.probeTries = 0;
-    this.lastOffDeg = -1;     // last lookAt's angle off our camera ray (diagnostics)
-    this.lastHitDist = -1;
-    this.recent = [];         // 1 = aligned, 0 = not, for the last ~2 s of frames
+    this.solidRadius = 0.35;  // each point acts as a small sphere
     this.lastSrc = 'sea';
 };
 
@@ -710,50 +722,6 @@ FPV.World.prototype.collide = function (pos, r) {
         }
     }
     return best;
-};
-
-// Share of recent frames where the aim ray lined up with our camera.
-FPV.World.prototype.probeRatio = function () {
-    if (!this.recent.length) { return 0; }
-    let n = 0;
-    for (let i = 0; i < this.recent.length; i++) { n += this.recent[i]; }
-    return n / this.recent.length;
-};
-
-// Feed one lookAt point. `cams` are the camera poses we set over the last few
-// frames ({pos, fwd}); the game may answer with a frame or two of lag. If the
-// point lines up with one of them, the aim ray follows our camera and it is a
-// real surface hit: it becomes a floor sample and a solid point. Returns the
-// hit distance along the matching ray, or -1.
-FPV.World.prototype.probe = function (cams, hit) {
-    this.probeValid = false;
-    this.probeTries++;
-    let aligned = 0;
-    let bestCos = -2, bestDist = -1;
-    if (hit && FPV.isFiniteVec(hit) && !(hit.x === 0 && hit.y === 0 && hit.z === 0)) {
-        for (let i = 0; i < cams.length; i++) {
-            const d = FPV.sub(hit, cams[i].pos);
-            const dist = FPV.len(d);
-            if (dist < 0.05) { continue; }
-            const cos = FPV.dot(FPV.scale(d, 1 / dist), cams[i].fwd);
-            if (cos > bestCos) { bestCos = cos; bestDist = dist; }
-        }
-        if (bestCos > -2) {
-            this.lastOffDeg = Math.acos(FPV.clamp(bestCos, -1, 1)) / FPV.DEG;
-            this.lastHitDist = bestDist;
-            aligned = bestCos >= 0.9986 && bestDist < 1200 ? 1 : 0;   // within ~3 degrees
-        }
-    }
-    this.recent.push(aligned);
-    if (this.recent.length > 120) { this.recent.shift(); }
-    if (!aligned) { return -1; }
-    if (Math.abs(hit.y - this.seaLevel) > 0.05) {
-        this.addSample(hit);
-        this.addSolid(hit);
-    }
-    this.probeValid = true;
-    this.validSamples++;
-    return bestDist;
 };
 
 // ===== swarm.js =====
@@ -1497,8 +1465,7 @@ const settings = {
     mode: 'acro',
     altHold: false,
     view: 'fpv',
-    kbStrength: 0.6,
-    keepControls: false   // experiment: leave game controls on while flying
+    kbStrength: 0.6
 };
 
 let tune = FPV.cloneTune(FPV.DEFAULT_TUNE);
@@ -1519,7 +1486,6 @@ let savedFov = null;
 let chatOpen = false;
 let menuOpen = false;
 let prevCam = null;             // camera pose we set last frame
-const camRing = [];             // last few camera poses {pos, fwd} for lookAt matching
 let chaseYaw = 0;
 let videoGlitchUntil = 0;
 let armSwitchPrev = null;
@@ -1643,7 +1609,7 @@ function recordFootprints(now) {
 
 // The radio in Rico's hands (ours, and every other pilot's).
 function drawRadios(r) {
-    if (status === 'flying' && typeof jcmp.localPlayer.GetBoneTransform === 'function') {
+    if (status === 'flying' && !proxy.active && typeof jcmp.localPlayer.GetBoneTransform === 'function') {
         models.drawRadio(r, function () { return jcmp.localPlayer.GetBoneTransform(BONE_RIGHT_HAND_ATTACH, r.dtf || 0); });
     }
     if (!jcmp.players) { return; }
@@ -1736,7 +1702,7 @@ function begin() {
 
     savedFov = lp.camera.fieldOfView;
     lp.frozen = true;
-    lp.controlsEnabled = !!settings.keepControls;
+    lp.controlsEnabled = false;
     lp.camera.attachedToPlayer = false;
     lp.camera.fieldOfView = settings.camera.fovDeg * FPV.DEG;
     if (typeof jcmp.ui.HideHud === 'function') { jcmp.ui.HideHud(); }
@@ -1745,7 +1711,7 @@ function begin() {
     lastFrame = Date.now();
     acc = 0;
     prevCam = null;
-    camRing.length = 0;
+    proxyReset();
     chaseYaw = FPV.yawOf(heading);
     armSwitchPrev = null;
     armBlockedReason = '';
@@ -1763,6 +1729,8 @@ function end(tellServer) {
     const lp = jcmp.localPlayer;
     lp.camera.attachedToPlayer = true;
     if (savedFov !== null) { lp.camera.fieldOfView = savedFov; }
+    if (proxy.active && launch) { lp.position = toVec3f(launch); }   // the server also returns him
+    proxyReset();
     lp.frozen = false;
     lp.controlsEnabled = !chatOpen && !menuOpen;
     if (typeof jcmp.ui.ShowHud === 'function') { jcmp.ui.ShowHud(); }
@@ -1781,7 +1749,6 @@ function resetDrone() {
     drone = FPV.createState(FPV.add(launch, { x: fwd.x * 1.5, y: tune.collisionRadius, z: fwd.z * 1.5 }), heading);
     drone.onGround = true;
     armSwitchPrev = null;
-    if (cfg.followDistance) { jcmp.events.CallRemote('fpv/follow', launch.x, launch.y, launch.z, 1); }
     lastFollow = { x: launch.x, y: launch.y, z: launch.z };
     notify('Drone reset to launch point', 'info');
 }
@@ -2003,35 +1970,95 @@ function onOwnCrash(ev) {
     startHandover(drone.pos);
 }
 
-function probeTerrain(dt) {
-    if (!prevCam) { return; }
-    let hit = null;
-    try { hit = jcmp.localPlayer.lookAt; } catch (e) { hit = null; }
-    const dist = world.probe(camRing, hit ? fromVec3f(hit) : null);
-    const camFwd = FPV.qRotate(prevCam.q, { x: 0, y: 0, z: -1 });
-    if (dist < 0 || settings.view !== 'fpv' || drone.crashed || handover) { return; }
+// ---- collision via Rico's body ----------------------------------------------
+//
+// The scripting API cannot query the game's physics, but the game simulates
+// Rico. Once the quad is armed, Rico's (unfrozen) body is moved along with it
+// every frame - behind the FPV camera, or below the quad in chase view - and
+// next frame we read back where the engine actually left him. If he was
+// pushed sideways or up, or stopped falling early, his capsule touched real
+// geometry: terrain, a wall, a tree, a car. That contact becomes a surface
+// plane the quad cannot pass, and is remembered (ground samples / solid
+// points) so wingmen and later flights collide with it too.
 
-    // Head-on obstacle check along the camera ray.
-    const along = FPV.dot(drone.vel, camFwd);
-    const reach = tune.collisionRadius + 0.2 + Math.max(along, 0) * dt * 1.5;
-    if (along > 1.5 && dist < reach) {
-        const h = fromVec3f(hit);
-        drone.pos = FPV.sub(h, FPV.scale(camFwd, tune.collisionRadius + 0.05));
-        if (along > tune.crashSpeed) {
-            // Report the crash at the surface we hit (the attack point).
-            FPV.crash(drone, 'IMPACT');
-            const ev = drone.events[drone.events.length - 1];
-            ev.speed = along;
-            drone.pos = h;
-            drone.vel = FPV.scale(drone.vel, -0.1);
-            // Looking down at what we hit -> it is ground, rest on it. A wall
-            // hit lets the wreck drop to whatever floor is known below.
-            if (camFwd.y < -0.5) { world.addPad(h.x, h.y, h.z, 1.5); }
-        } else {
-            // Gentle bump: bounce off, stay armed.
-            drone.vel = FPV.sub(drone.vel, FPV.scale(camFwd, along * 1.4));
-        }
+const PROXY_RADIUS = 0.35;      // Rico's capsule radius
+const PROXY_PLANE_TTL = 400;    // ms a contact plane stays active
+const proxy = { active: false, set: null, freeDy: 0, frames: 0, contacts: 0, lost: 0, last: null, planes: [] };
+
+function proxyReset() {
+    proxy.active = false;
+    proxy.set = null;
+    proxy.freeDy = 0;
+    proxy.planes = [];
+    proxy.last = null;
+}
+
+// Where to put Rico this frame (feet position) for the quad at `pos`.
+function proxyTarget(view) {
+    if (view === 'fpv' && !handover) {
+        // Just behind the camera, feet a little below the quad: out of shot.
+        const yaw = FPV.yawOf(drone.q);
+        const back = FPV.qRotate(FPV.qAxisAngle({ x: 0, y: 1, z: 0 }, yaw), { x: 0, y: 0, z: 0.7 });
+        return { x: drone.pos.x + back.x, y: drone.pos.y - 0.3, z: drone.pos.z + back.z };
     }
+    // Chase / line of sight / handover: hang below the quad.
+    return { x: drone.pos.x, y: drone.pos.y - 1.95, z: drone.pos.z };
+}
+
+// Read back what the engine did to Rico since we placed him.
+function proxyRead(now) {
+    if (!proxy.active || !proxy.set) { return; }
+    const lp = jcmp.localPlayer;
+    const a = fromVec3f(lp.position);
+    const d = FPV.sub(a, proxy.set);
+    proxy.frames++;
+    proxy.last = d;
+    if (!FPV.isFiniteVec(a) || FPV.len(d) > 25) { proxy.lost++; return; }   // teleport ignored / respawned
+
+    const dh = Math.sqrt(d.x * d.x + d.z * d.z);
+    let n = null;
+    if (dh > 0.04 || d.y > 0.02) {
+        // Pushed out of something.
+        n = FPV.norm({ x: d.x, y: Math.max(d.y, 0), z: d.z });
+    } else if (proxy.freeDy < -0.05 && d.y > proxy.freeDy * 0.5) {
+        // Was falling, fell much less than usual: landed on something.
+        n = { x: 0, y: 1, z: 0 };
+    } else {
+        proxy.freeDy += (d.y - proxy.freeDy) * 0.25;   // learn the free-fall drift
+    }
+    if (!n || FPV.len(n) < 0.5) { return; }
+
+    proxy.contacts++;
+    // Ground: the plane is at his feet. Walls: one capsule radius beyond his body.
+    const ground = n.y > 0.7;
+    const point = ground ? a : FPV.sub({ x: a.x, y: a.y + 0.9, z: a.z }, FPV.scale(n, PROXY_RADIUS));
+    proxy.planes.push({ point: point, n: n, t: now });
+    if (proxy.planes.length > 8) { proxy.planes.shift(); }
+    if (ground) { world.addGround(a.x, a.y, a.z); } else { world.addSolid(point); }
+}
+
+// Keep a quad outside the recent contact planes near it.
+function applyProxyPlanes(s, now) {
+    for (let i = proxy.planes.length - 1; i >= 0; i--) {
+        const p = proxy.planes[i];
+        if (now - p.t > PROXY_PLANE_TTL) { proxy.planes.splice(i, 1); continue; }
+        const dx = s.pos.x - p.point.x, dz = s.pos.z - p.point.z;
+        if (dx * dx + dz * dz > 2.5 * 2.5) { continue; }   // planes are local
+        FPV.planeContact(s, p.point, p.n, tune);
+    }
+}
+
+// Move Rico along with the quad for the next physics step.
+function proxyPlace() {
+    if (!drone.armed && !proxy.active) { return; }   // Rico stands at launch until take-off
+    const lp = jcmp.localPlayer;
+    if (!proxy.active) {
+        proxy.active = true;
+        lp.frozen = false;
+    }
+    const t = proxyTarget(settings.view);
+    lp.position = toVec3f(t);
+    proxy.set = t;
 }
 
 function packDrone(id, s, flags) {
@@ -2049,18 +2076,6 @@ function sendState(now) {
         list.push(packDrone(w.id, w.s, (w.s.armed ? FPV.FLAG_ARMED : 0) | (w.s.crashed ? FPV.FLAG_CRASHED : 0)));
     });
     jcmp.events.CallRemote('fpv/swarm', JSON.stringify(list));
-}
-
-function followCheck(now) {
-    // The world streams around the (frozen) character, so drag it along
-    // underneath the drone when we get far away.
-    if (now - lastFollowCheck < 1000 || !cfg.followDistance) { return; }
-    lastFollowCheck = now;
-    const dx = drone.pos.x - lastFollow.x, dz = drone.pos.z - lastFollow.z;
-    if (dx * dx + dz * dz > cfg.followDistance * cfg.followDistance) {
-        jcmp.events.CallRemote('fpv/follow', drone.pos.x, drone.pos.y, drone.pos.z, 0);
-        lastFollow = { x: drone.pos.x, y: drone.pos.y, z: drone.pos.z };
-    }
 }
 
 function sendOsd(now) {
@@ -2102,17 +2117,16 @@ function sendOsd(now) {
         amps: drone.currentA,
         time: drone.flightTime,
         noise: noise,
-        probe: world.probeValid,
         fps: Math.round(fps),
         sticks: { t: input.throttle, r: input.roll, p: input.pitch, y: input.yaw },
         dbg: {
-            probeOk: world.validSamples,
-            probeTries: world.probeTries,
-            probeRatio: Math.round(world.probeRatio() * 100),
-            probeOff: Math.round(world.lastOffDeg * 10) / 10,
-            probeDist: Math.round(world.lastHitDist * 10) / 10,
+            proxyOn: proxy.active,
+            proxyFrames: proxy.frames,
+            proxyContacts: proxy.contacts,
+            proxyLost: proxy.lost,
+            proxyDrift: proxy.last ? [Math.round(proxy.last.x * 100) / 100, Math.round(proxy.last.y * 100) / 100, Math.round(proxy.last.z * 100) / 100] : null,
+            proxyPlanes: proxy.planes.length,
             solids: world.solidCount,
-            keepControls: !!settings.keepControls,
             samples: world.sampleCount(),
             floor: Math.round((world.floorAt(s.pos).y - launch.y) * 10) / 10,
             floorSrc: world.lastSrc,
@@ -2174,14 +2188,14 @@ function frame(r) {
     input.altHold = settings.altHold;
     resolveInput(now, dt);
 
+    proxyRead(now);
     acc += dt;
     while (acc >= STEP) {
         FPV.step(drone, input, world, tune, STEP);
+        applyProxyPlanes(drone, now);
         acc -= STEP;
     }
     if (drone.pos.y > cfg.maxAltitude) { drone.pos.y = cfg.maxAltitude; if (drone.vel.y > 0) { drone.vel.y = 0; } }
-
-    probeTerrain(dt);
 
     while (drone.events.length) {
         const ev = drone.events.shift();
@@ -2209,16 +2223,14 @@ function frame(r) {
     const cam = cameraFor(settings.view, dt);
     applyCamera(cam);
     prevCam = cam;
-    camRing.unshift({ pos: cam.pos, fwd: FPV.qRotate(cam.q, { x: 0, y: 0, z: -1 }) });
-    if (camRing.length > 3) { camRing.pop(); }
+    proxyPlace();
 
     if (now - lastControlsAssert > 500) {
         lastControlsAssert = now;
-        jcmp.localPlayer.controlsEnabled = !!settings.keepControls && !chatOpen;
+        jcmp.localPlayer.controlsEnabled = false;
     }
 
     sendState(now);
-    followCheck(now);
     sendOsd(now);
 }
 
@@ -2318,7 +2330,6 @@ jcmp.ui.AddEvent('fpv/ui/settings', (json) => {
     if (MODES.indexOf(s.mode) >= 0) { settings.mode = s.mode; }
     if (typeof s.altHold === 'boolean') { settings.altHold = s.altHold; }
     if (isFinite(s.kbStrength)) { settings.kbStrength = FPV.clamp(+s.kbStrength, 0.1, 1); }
-    if (typeof s.keepControls === 'boolean') { settings.keepControls = s.keepControls; }
     if (VIEWS.indexOf(s.view) >= 0) { settings.view = s.view; }
     rebuildTune();
     if (status === 'flying') { jcmp.localPlayer.camera.fieldOfView = settings.camera.fovDeg * FPV.DEG; }

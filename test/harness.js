@@ -116,10 +116,16 @@ function Client(server, player) {
     this.uiHandlers = {};
     this.uiCalls = [];
     this.errors = [];
+    this.teleports = 0;
+    // Minimal stand-in for the game's character physics: gravity (velocity is
+    // NOT reset by teleports - worst case), a ground plane and an optional
+    // wall plane {n, d} (Rico's capsule centre stays at dot(p, n) <= d - 0.35).
+    this.engine = { ground: 1050, wall: null, vy: 0 };
     const self = this;
     const lp = {
         networkId: player.networkId,
         get position() { return new Vector3f(player.position.x, player.position.y, player.position.z); },
+        set position(v) { assertVec(v); player.position = new Vector3f(v.x, v.y, v.z); self.teleports++; },
         camera: { position: new Vector3f(player.position.x, player.position.y + 2, player.position.z + 4),
             rotation: new Vector3f(0, 0.5, 0), attachedToPlayer: true, fieldOfView: 1.0 },
         frozen: false,
@@ -177,7 +183,22 @@ Client.prototype.hold = function (t, roll, pitch, yaw, arm, mode) {
 Client.prototype.release = function () { this.held = null; };
 Client.prototype.key = function (code, down) { this.ui('fpv/ui/key', code, down ? 1 : 0); };
 
+Client.prototype.engineStep = function () {
+    const e = this.engine;
+    const p = this.player.position;
+    if (this.lp.frozen) { e.vy = 0; return; }
+    e.vy -= 9.81 / 60;
+    let y = p.y + e.vy / 60, x = p.x, z = p.z;
+    if (y < e.ground) { y = e.ground; e.vy = 0; }
+    if (e.wall) {
+        const over = x * e.wall.n.x + z * e.wall.n.z - (e.wall.d - 0.35);
+        if (over > 0) { x -= e.wall.n.x * over; z -= e.wall.n.z * over; }
+    }
+    this.player.position = new Vector3f(x, y, z);
+};
+
 Client.prototype.frame = function () {
+    this.engineStep();
     if (this.held) { this.uiHandlers['fpv/ui/sticks'](...this.held); }
     const r = makeRenderer();
     (this.events.GameUpdateRender || []).forEach((fn) => fn(r));

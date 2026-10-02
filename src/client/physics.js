@@ -277,6 +277,27 @@ FPV.step = function (s, input, env, tune, dt) {
     return s;
 };
 
+// Keep the quad on the outside of a surface plane (point + outward normal),
+// e.g. one reported by the game's own physics. Slow contact slides and
+// bounces like a character against a wall; fast contact is a crash.
+// Returns true if the quad was touching the plane.
+FPV.planeContact = function (s, point, n, tune) {
+    const r = tune.collisionRadius;
+    const gap = FPV.dot(FPV.sub(s.pos, point), n) - r;
+    if (gap >= 0) { return false; }
+    s.pos = FPV.add(s.pos, FPV.scale(n, -gap));
+    const vn = FPV.dot(s.vel, n);
+    if (vn < 0) {
+        if (-vn > tune.crashSpeed && !s.crashed) {
+            FPV.crash(s, 'IMPACT');
+            s.events[s.events.length - 1].speed = -vn;
+        }
+        s.vel = FPV.scale(FPV.sub(s.vel, FPV.scale(n, vn * 1.3)), 0.92);
+    }
+    if (n.y > 0.7) { s.onGround = true; }
+    return true;
+};
+
 // Arming checks, mirroring a real flight controller. Returns '' on success or
 // the reason arming was refused.
 FPV.tryArm = function (s, input) {

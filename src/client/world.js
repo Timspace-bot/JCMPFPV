@@ -1,17 +1,14 @@
 // ---------------------------------------------------------------------------
-// world.js - what the drone can collide with.
+// world.js - what the drone remembers about the world's surfaces.
 //
-// JC3MP's client API has no physics raycast, so the floor is built from:
+// JC3MP's scripting API has no physics query. Live collision comes from Rico's
+// body (see the collision proxy in client.js); everything it touches, and
+// everywhere a character has stood, is remembered here so that wingmen and
+// later flights collide with it too:
 //   * sea level (water = crash),
-//   * "pads": known-good ground points (the launch spot under your feet,
-//     crash sites),
-//   * surface samples from jcmp.localPlayer.lookAt - the game's own aim ray.
-//     While the camera is detached that ray *may* follow our camera; every
-//     sample is checked against the camera ray and discarded if it does not
-//     line up, so a game build where lookAt does not follow simply falls back
-//     to pads + sea level. In FPV you are almost always looking at the ground
-//     ahead of you, so the terrain you are about to fly over gets sampled
-//     before you get there.
+//   * pads: known ground at the launch spot / crash sites,
+//   * ground samples: a heightfield of 2 m cells (floor lookups search ~5 m),
+//   * solid points: wall/tree/building contacts, 0.35 m spheres.
 // ---------------------------------------------------------------------------
 
 FPV.World = function (seaLevel) {
@@ -22,18 +19,12 @@ FPV.World = function (seaLevel) {
     this.cellSize = 2.0;
     this.maxCells = 30000;
     this.searchCells = 2;     // floor lookups also consider samples up to 2 cells (~5 m) away
-    // Solid points: every surface the aim ray has hit (walls, trees, rocks,
-    // buildings, ground). The quad collides with them like a character does.
+    // Solid points: wall/tree/building contacts reported by the game's physics
+    // (see the Rico collision proxy in client.js). Quads collide with them.
     this.solids = {};         // "x:y:z" (1 m cells) -> [{x,y,z}, ...]
     this.solidCount = 0;
     this.maxSolids = 250000;
-    this.solidRadius = 0.35;  // each hit point acts as a small sphere
-    this.probeValid = false;  // did the last lookAt sample line up with our camera?
-    this.validSamples = 0;
-    this.probeTries = 0;
-    this.lastOffDeg = -1;     // last lookAt's angle off our camera ray (diagnostics)
-    this.lastHitDist = -1;
-    this.recent = [];         // 1 = aligned, 0 = not, for the last ~2 s of frames
+    this.solidRadius = 0.35;  // each point acts as a small sphere
     this.lastSrc = 'sea';
 };
 
@@ -157,48 +148,4 @@ FPV.World.prototype.collide = function (pos, r) {
         }
     }
     return best;
-};
-
-// Share of recent frames where the aim ray lined up with our camera.
-FPV.World.prototype.probeRatio = function () {
-    if (!this.recent.length) { return 0; }
-    let n = 0;
-    for (let i = 0; i < this.recent.length; i++) { n += this.recent[i]; }
-    return n / this.recent.length;
-};
-
-// Feed one lookAt point. `cams` are the camera poses we set over the last few
-// frames ({pos, fwd}); the game may answer with a frame or two of lag. If the
-// point lines up with one of them, the aim ray follows our camera and it is a
-// real surface hit: it becomes a floor sample and a solid point. Returns the
-// hit distance along the matching ray, or -1.
-FPV.World.prototype.probe = function (cams, hit) {
-    this.probeValid = false;
-    this.probeTries++;
-    let aligned = 0;
-    let bestCos = -2, bestDist = -1;
-    if (hit && FPV.isFiniteVec(hit) && !(hit.x === 0 && hit.y === 0 && hit.z === 0)) {
-        for (let i = 0; i < cams.length; i++) {
-            const d = FPV.sub(hit, cams[i].pos);
-            const dist = FPV.len(d);
-            if (dist < 0.05) { continue; }
-            const cos = FPV.dot(FPV.scale(d, 1 / dist), cams[i].fwd);
-            if (cos > bestCos) { bestCos = cos; bestDist = dist; }
-        }
-        if (bestCos > -2) {
-            this.lastOffDeg = Math.acos(FPV.clamp(bestCos, -1, 1)) / FPV.DEG;
-            this.lastHitDist = bestDist;
-            aligned = bestCos >= 0.9986 && bestDist < 1200 ? 1 : 0;   // within ~3 degrees
-        }
-    }
-    this.recent.push(aligned);
-    if (this.recent.length > 120) { this.recent.shift(); }
-    if (!aligned) { return -1; }
-    if (Math.abs(hit.y - this.seaLevel) > 0.05) {
-        this.addSample(hit);
-        this.addSolid(hit);
-    }
-    this.probeValid = true;
-    this.validSamples++;
-    return bestDist;
 };

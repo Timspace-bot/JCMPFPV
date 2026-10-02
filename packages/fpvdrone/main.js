@@ -56,7 +56,8 @@ function stopFlying(player, reason) {
     pilots.delete(player.networkId);
     try {
         if (config.invulnerableWhileFlying) { player.invulnerable = pilot.wasInvulnerable; }
-        if (config.returnToLaunch && pilot.followed) { player.position = pilot.launch; }
+        // Rico was carried along with the drone as its collision body.
+        if (config.returnToLaunch) { player.position = pilot.launch; }
     } catch (e) { /* player may already be gone */ }
     jcmp.events.CallRemote('fpv/remote_stop', null, player.networkId);
     if (reason) { jcmp.events.CallRemote('fpv/force_stop', player, reason); }
