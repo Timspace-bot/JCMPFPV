@@ -31,9 +31,13 @@ function assertVec(v) {
 }
 
 function makeRenderer() {
-    const r = { draws: 0, texts: 0, transforms: 0 };
+    const r = { draws: 0, texts: 0, transforms: 0, flashes: 0 };
     r.SetTransform = (m) => { if (!(m instanceof Matrix)) { throw new Error('SetTransform needs Matrix'); } r.transforms++; };
-    r.DrawTexture = (t, p, s) => { if (!(t instanceof Texture)) { throw new Error('bad texture'); } assertVec(p); r.draws++; };
+    r.DrawTexture = (t, p, s) => {
+        if (!(t instanceof Texture)) { throw new Error('bad texture'); }
+        if (p instanceof Vector2f) { if (!isFinite(p.x) || !isFinite(p.y)) { throw new Error('bad 2d pos'); } r.flashes++; return; }
+        assertVec(p); r.draws++;
+    };
     r.DrawText = (txt, p, max, col, size, font) => { assertVec(p); r.texts++; };
     r.MeasureText = (t, size) => new Vector2f(t.length * size * 0.5, size);
     r.WorldToScreen = (p) => { assertVec(p); return new Vector2f(960, 540); };
@@ -48,8 +52,10 @@ function Server() {
     this.remote = {};
     this.log = [];
     const self = this;
+    this.vehicles = [];
     const jcmp = {
         players: this.players,
+        vehicles: this.vehicles,
         events: {
             Add: (n, fn) => { (self.events[n] = self.events[n] || []).push(fn); },
             Call: (n, ...a) => (self.events[n] || []).map((fn) => fn(...a)),
@@ -113,6 +119,8 @@ function Client(server, player) {
     this.lp = lp;
     const jcmp = {
         localPlayer: lp,
+        players: server.players,
+        vehicles: server.vehicles,
         viewportSize: new Vector2(1920, 1080),
         print: (m) => { self.errors.push(m); },
         events: {

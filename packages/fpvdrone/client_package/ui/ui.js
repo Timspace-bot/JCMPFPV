@@ -11,7 +11,9 @@
 
     const DEG = Math.PI / 180;
     const STORAGE_KEY = 'fpvdrone.settings.v1';
-    const CHANNELS = ['throttle', 'yaw', 'pitch', 'roll', 'arm', 'mode'];
+    const CHANNELS = ['throttle', 'yaw', 'pitch', 'roll', 'arm', 'mode', 'call', 'attack', 'switch'];
+    // Momentary channels: a rising edge (button press / switch flip) fires a command.
+    const TRIGGERS = ['call', 'attack', 'switch'];
     const KEY_ACTIONS = [
         ['toggle', 'Launch / exit FPV'],
         ['menu', 'Settings menu'],
@@ -19,19 +21,26 @@
         ['reset', 'Reset drone to launch point'],
         ['mode', 'Cycle flight mode'],
         ['althold', 'Toggle altitude assist'],
-        ['view', 'Cycle view (FPV / chase / line of sight)']
+        ['view', 'Cycle view (FPV / chase / line of sight)'],
+        ['call', 'Swarm: call in a wingman'],
+        ['attack', 'Swarm: attack everything nearby / call off'],
+        ['switch', 'Swarm: switch to next drone']
     ];
 
     const PRESETS = {
         rc: {
             throttle: { src: 'axis:2', invert: false }, yaw: { src: 'axis:3', invert: false },
             pitch: { src: 'axis:1', invert: false }, roll: { src: 'axis:0', invert: false },
-            arm: { src: 'axis:4', invert: false }, mode: { src: 'axis:5', invert: false }
+            arm: { src: 'axis:4', invert: false }, mode: { src: 'axis:5', invert: false },
+            call: { src: 'axis:6', invert: false }, attack: { src: 'axis:7', invert: false },
+            switch: { src: 'none', invert: false }
         },
         xbox: {
             throttle: { src: 'axis:1', invert: true }, yaw: { src: 'axis:0', invert: false },
             pitch: { src: 'axis:3', invert: true }, roll: { src: 'axis:2', invert: false },
-            arm: { src: 'button:5', invert: false }, mode: { src: 'button:4', invert: false }
+            arm: { src: 'button:5', invert: false }, mode: { src: 'button:4', invert: false },
+            call: { src: 'button:3', invert: false }, attack: { src: 'button:2', invert: false },
+            switch: { src: 'button:1', invert: false }
         }
     };
 
@@ -65,7 +74,7 @@
                 cal: {}
             },
             osd: { ahi: true, noise: true, name: '' },
-            keys: { toggle: 118, menu: 119, arm: 69, reset: 82, mode: 77, althold: 72, view: 86 }
+            keys: { toggle: 118, menu: 119, arm: 69, reset: 82, mode: 77, althold: 72, view: 86, call: 67, attack: 71, switch: 78 }
         };
     }
 
@@ -228,10 +237,10 @@
     }
 
     function rising(name, value) {
-        const was = !!prevButtons[name];
+        const was = prevButtons[name];
         const now = value > 0.5;
         prevButtons[name] = now;
-        return now && !was;
+        return was === false && now;   // undefined on first read: a switch already ON does not fire
     }
 
     function readGamepad(pad) {
@@ -258,6 +267,12 @@
         } else if (modeSrc.type === 'button' && rising('mode', modeV) && active) {
             J.CallEvent('fpv/ui/cmd', 'mode');
         }
+        out.aux = {};
+        TRIGGERS.forEach(function (name) {
+            const v = channel(pad, name);
+            out.aux[name] = v === null ? -2 : v;
+            if (v !== null && rising(name, v) && active && !chatOpen) { J.CallEvent('fpv/ui/cmd', name); }
+        });
         return out;
     }
 
@@ -326,6 +341,7 @@
         ctx.textAlign = align || 'left';
         ctx.textBaseline = 'middle';
         ctx.lineWidth = 3 * sc;
+        ctx.lineJoin = 'round';
         ctx.strokeStyle = 'rgba(0,0,0,0.9)';
         ctx.strokeText(s, x, y);
         ctx.fillStyle = color || '#fff';
@@ -419,6 +435,13 @@
         txt(modeName + (o.altHold && o.mode !== 'acro' ? ' AH' : ''), L, T, 'left');
         if (S.osd.name) { txt(S.osd.name.toUpperCase(), w / 2, T, 'center'); }
         txt((o.view === 'fpv' ? '' : o.view.toUpperCase() + '  ') + fmtTime(o.time), R, T, 'right');
+        if (o.swarm) {
+            const sw = o.swarm;
+            const state = sw.atk ? 'ATTACK ' + sw.atk : (sw.mode === 'support' ? 'ORBIT' : 'FORM');
+            txt('W' + sw.id + '  SWARM ' + sw.n + '/' + sw.max + (sw.n ? '  ' + state : ''), L, T + 24 * sc, 'left', 15,
+                sw.atk ? '#ff6e5a' : '#5adcff');
+        }
+        if (o.banner) { txt(o.banner, w / 2, h * 0.22, 'center', 24, '#5adcff'); }
 
         txt(Math.round(o.speed) + ' KM/H', L, h / 2, 'left');
         txt(Math.round(o.alt) + ' M', R, h / 2 - 12 * sc, 'right');
@@ -438,8 +461,10 @@
         // centre warnings
         let warn = '';
         let sub = '';
-        if (o.crashed) {
-            warn = o.reason === 'WATER' ? 'SPLASH' : 'CRASH';
+        if (o.handover) {
+            warn = '';
+        } else if (o.crashed) {
+            warn = o.reason === 'WATER' ? 'SPLASH' : (o.reason === 'HIT' ? 'SHOT DOWN' : 'CRASH');
             sub = o.reason === 'WATER' ? 'R TO RESET' : 'E TO RE-ARM   R TO RESET';
         } else if (!o.armed) {
             warn = 'DISARMED';
@@ -469,7 +494,7 @@
         body.innerHTML = '';
         CHANNELS.forEach(function (name) {
             const tr = document.createElement('tr');
-            tr.innerHTML = '<td>' + name.charAt(0).toUpperCase() + name.slice(1) + (name === 'mode' ? ' (low acro / mid horizon / high angle)' : '') + '</td>' +
+            tr.innerHTML = '<td>' + name.charAt(0).toUpperCase() + name.slice(1) + (name === 'mode' ? ' (low acro / mid horizon / high angle)' : '') + (TRIGGERS.indexOf(name) >= 0 ? ' (button / momentary switch)' : '') + '</td>' +
                 '<td><select class="ch-src">' + srcOptions() + '</select></td>' +
                 '<td><input type="checkbox" class="ch-inv"></td>' +
                 '<td><button class="ch-detect">Detect</button></td>' +
@@ -563,7 +588,10 @@
             for (let i = 0; i < pad.axes.length && i < 8; i++) { raw += '<span>A' + i + ' ' + pad.axes[i].toFixed(2) + '</span>'; }
             $('raw-axes').innerHTML = raw;
         }
-        const vals = { throttle: st.t * 2 - 1, yaw: st.y, pitch: st.p, roll: st.r, arm: st.arm, mode: st.mode };
+        const aux = st.aux || {};
+        const vals = { throttle: st.t * 2 - 1, yaw: st.y, pitch: st.p, roll: st.r, arm: st.arm, mode: st.mode,
+            call: aux.call === undefined ? -2 : aux.call, attack: aux.attack === undefined ? -2 : aux.attack,
+            switch: aux.switch === undefined ? -2 : aux.switch };
         CHANNELS.forEach(function (name) {
             const bar = document.querySelector('tr[data-ch="' + name + '"] .bar i');
             if (!bar) { return; }
@@ -753,6 +781,9 @@
         else if (code === S.keys.mode) { J.CallEvent('fpv/ui/cmd', 'mode'); }
         else if (code === S.keys.althold) { J.CallEvent('fpv/ui/cmd', 'althold'); }
         else if (code === S.keys.view) { J.CallEvent('fpv/ui/cmd', 'view'); }
+        else if (code === S.keys.call) { J.CallEvent('fpv/ui/cmd', 'call'); }
+        else if (code === S.keys.attack) { J.CallEvent('fpv/ui/cmd', 'attack'); }
+        else if (code === S.keys.switch) { J.CallEvent('fpv/ui/cmd', 'switch'); }
     });
 
     document.addEventListener('keyup', function (e) { keys[e.keyCode] = false; });
@@ -808,7 +839,8 @@
         active = true;
         osd = { armed: true, crashed: false, mode: 'angle', altHold: true, view: 'fpv', thr: 0.42, speed: 87, vspeed: 1.3,
             alt: 34, home: 412, homeDir: 0.6, pitch: -0.3, roll: 0.25, tilt: 25, cell: 3.82, cells: 4, mah: 512,
-            cap: 1500, batt: true, amps: 31, time: 83, noise: 0.15, probe: true };
+            cap: 1500, batt: true, amps: 31, time: 83, noise: 0.15, probe: true,
+            swarm: { n: 3, max: 5, mode: 'support', atk: 0, id: 2 }, banner: 'LINK > W2  AUTO-AIM' };
         if (/menu/.test(location.search)) { setMenu(true); }
     }
 })();

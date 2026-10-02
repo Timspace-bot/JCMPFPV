@@ -136,7 +136,14 @@ test('server: follow only moves the character to the real drone position', () =>
     server.fromClient(a.player, 'fpv/follow', [start.x + 5000, 1500, start.z, 0]);
     assert.strictEqual(a.player.position.x, start.x, 'teleport attempt ignored');
     // Garbage state packets are dropped instead of relayed.
-    server.fromClient(a.player, 'fpv/state', [NaN, 0, 0, 0, 0, 0, 1, 1, 0]);
+    server.fromClient(a.player, 'fpv/swarm', ['[[0,NaN]]']);
+    server.fromClient(a.player, 'fpv/swarm', ['{"x":1}']);
+    server.fromClient(a.player, 'fpv/swarm', [12]);
+    // Impacts far from any of the pilot's drones are ignored.
+    const hp = a.server.players[1].health;
+    a.server.players[1].position = new Vector3f(9000, 1050, 9000);
+    server.fromClient(a.player, 'fpv/impact', [0, 9000, 1050, 9000, 40]);
+    assert.strictEqual(a.server.players[1].health, hp, 'spoofed impact ignored');
     // Settings blob with junk does not break the client.
     a.ui('fpv/ui/settings', '{"tune":{"thrustToWeight":"lots"},"camera":{"eulerOrder":"QQQ","fovDeg":1e9}}');
     a.ui('fpv/ui/settings', 'not json');
@@ -155,4 +162,107 @@ test('server denies launch from a vehicle and when disabled', () => {
     server.run(5);   // let the pending request time out client-side
     a.ui('fpv/ui/cmd', 'toggle');
     assert.strictEqual(a.lp.camera.attachedToPlayer, true);
+});
+
+function osdOf(c) { return JSON.parse(c.lastUi('fpv/osd')[0]); }
+
+function hover(server, a, alt) {
+    a.ui('fpv/ui/settings', JSON.stringify({ mode: 'angle', altHold: true }));
+    a.ui('fpv/ui/cmd', 'toggle');
+    sticks(a, 0.5);
+    a.ui('fpv/ui/cmd', 'arm');
+    sticks(a, 1);
+    for (let i = 0; i < 100 && (!a.lastUi('fpv/osd') || osdOf(a).alt < alt); i++) { server.run(0.1); }
+    sticks(a, 0.5);
+    server.run(0.5);
+}
+
+test('swarm: call wingmen, they join, other players see the whole swarm', () => {
+    const { server, a, b } = setup();
+    hover(server, a, 40);
+    a.ui('fpv/ui/cmd', 'call');
+    a.ui('fpv/ui/cmd', 'call');
+    server.run(12);
+    const o = osdOf(a);
+    assert.strictEqual(o.swarm.n, 2, 'two wingmen flying');
+    assert.strictEqual(o.swarm.mode, 'formation');
+    assert.ok(o.alt > 30, 'leader still hovering at ' + o.alt);
+    const rb = b.frame();
+    assert.ok(rb.draws >= 6, 'Bob draws 3 drones (2 quads each), draws=' + rb.draws);
+    const ra = a.frame();
+    assert.ok(ra.draws >= 4, 'Alice sees her wingmen, draws=' + ra.draws);
+    assert.deepStrictEqual(a.errors, []);
+    assert.deepStrictEqual(b.errors, []);
+});
+
+test('swarm: when the player crashes, control jumps to a wingman aimed at the crash', () => {
+    const { server, a } = setup();
+    hover(server, a, 40);
+    a.ui('fpv/ui/cmd', 'call');
+    a.ui('fpv/ui/cmd', 'call');
+    server.run(12);
+    assert.strictEqual(osdOf(a).swarm.id, 0);
+
+    // Cut the motors: the quad drops into the sea below.
+    a.ui('fpv/ui/settings', JSON.stringify({ mode: 'acro', altHold: false }));
+    sticks(a, 0);
+    let switched = false;
+    for (let i = 0; i < 150 && !switched; i++) {
+        server.run(0.1);
+        const o = osdOf(a);
+        switched = o.swarm.id !== 0 && !o.handover;
+    }
+    const o = osdOf(a);
+    assert.ok(switched, 'control handed over: ' + JSON.stringify(o.swarm));
+    assert.strictEqual(o.armed, true, 'new drone is armed');
+    assert.strictEqual(o.crashed, false);
+    assert.strictEqual(o.swarm.n, 1, 'one wingman left');
+    assert.strictEqual(o.swarm.mode, 'support', 'remaining wingman circles the crash point');
+    assert.ok(o.alt > 5, 'still in the air');
+
+    // Switch command cycles to the remaining wingman.
+    const before = o.swarm.id;
+    a.ui('fpv/ui/cmd', 'switch');
+    server.run(0.2);
+    assert.notStrictEqual(osdOf(a).swarm.id, before);
+    assert.deepStrictEqual(a.errors, []);
+});
+
+test('swarm attack: wingmen ram a nearby player and the server applies damage', () => {
+    const { server, a, b } = setup();
+    hover(server, a, 30);
+    a.ui('fpv/ui/cmd', 'call');
+    a.ui('fpv/ui/cmd', 'call');
+    server.run(12);
+
+    // Bob is standing 60 m away on a rooftop.
+    const ap = a.lp.camera.position;
+    b.player.position = new Vector3f(ap.x + 60, ap.y - 20, ap.z);
+    const hp = b.player.health;
+    a.ui('fpv/ui/cmd', 'attack');
+    assert.ok(/attacking/.test(a.lastUi('fpv/notify')[0]), a.lastUi('fpv/notify')[0]);
+    let flashes = 0;
+    for (let i = 0; i < 100 && b.player.health === hp; i++) {
+        const r = server.run(0.1);
+        flashes += r[b.player.networkId].flashes;
+    }
+    assert.ok(b.player.health < hp, 'Bob took damage: ' + b.player.health);
+    server.run(0.2);
+    assert.strictEqual(osdOf(a).swarm.n, 0, 'kamikaze wingmen are spent');
+    assert.ok(a.uiCalls.some((c) => c[0] === 'fpv/notify' && /attacking/.test(c[1])));
+    assert.deepStrictEqual(a.errors, []);
+    assert.deepStrictEqual(b.errors, []);
+});
+
+test('swarm attack with nothing in range reports it; full swarm refuses more calls', () => {
+    const { server, a, b } = setup();
+    b.player.position = new Vector3f(90000, 1050, 0);
+    hover(server, a, 20);
+    a.ui('fpv/ui/cmd', 'attack');
+    assert.ok(/No wingmen/.test(a.lastUi('fpv/notify')[0]));
+    for (let i = 0; i < 6; i++) { a.ui('fpv/ui/cmd', 'call'); }
+    assert.ok(/Swarm full/.test(a.lastUi('fpv/notify')[0]));
+    server.run(1);
+    a.ui('fpv/ui/cmd', 'attack');
+    assert.ok(/No targets/.test(a.lastUi('fpv/notify')[0]), a.lastUi('fpv/notify')[0]);
 });

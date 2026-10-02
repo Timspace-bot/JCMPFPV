@@ -100,6 +100,7 @@ FPV.yawOf = function (q) {
 
 // Desired body rates (rad/s) for the current stick input and flight mode.
 FPV.desiredRates = function (s, input, tune) {
+    if (input.mode === 'direct') { return input.wDes; }   // autopilot (swarm wingmen)
     const R = tune.rates;
     const acro = {
         x: -FPV.bfRate(input.pitch, R.pitch) * FPV.DEG,  // stick forward -> nose down
@@ -136,6 +137,7 @@ FPV.desiredRates = function (s, input, tune) {
 
 FPV.motorCommand = function (s, input, tune) {
     if (!s.armed || s.crashed) { return 0; }
+    if (input.mode === 'direct') { return FPV.clamp(input.thrustCmd, tune.idleThrottle, 1); }
     const thrust = FPV.throttleCurve(input.throttle, tune.throttleMid, tune.throttleExpo);
     if (input.altHold && input.mode !== 'acro') {
         // Throttle stick commands a climb rate; centre stick = hover.
@@ -161,6 +163,17 @@ FPV.updateBattery = function (s, tune, dt) {
     s.cellVoltage = Math.max(2.8, rest - packSag / b.cells);
     if (charge <= 0) { return 0.3; }
     return 0.75 + 0.25 * FPV.clamp((rest - 3.3) / 0.9, 0, 1);
+};
+
+// Aerodynamic drag (world frame, Newtons) for attitude q moving at vel.
+FPV.dragForce = function (q, vel, tune) {
+    const vb = FPV.qRotate(FPV.qConj(q), vel);
+    const db = tune.dragBody;
+    return FPV.qRotate(q, {
+        x: -db.x * Math.abs(vb.x) * vb.x - tune.dragLinear * vb.x,
+        y: -db.y * Math.abs(vb.y) * vb.y - tune.dragLinear * vb.y,
+        z: -db.z * Math.abs(vb.z) * vb.z - tune.dragLinear * vb.z
+    });
 };
 
 FPV.crash = function (s, reason) {
@@ -199,14 +212,7 @@ FPV.step = function (s, input, env, tune, dt) {
     let force = FPV.scale(up, s.motor * maxThrust * battFactor);
     force.y -= m * g;
 
-    const vb = FPV.qRotate(FPV.qConj(s.q), s.vel);
-    const db = tune.dragBody;
-    const dragB = {
-        x: -db.x * Math.abs(vb.x) * vb.x - tune.dragLinear * vb.x,
-        y: -db.y * Math.abs(vb.y) * vb.y - tune.dragLinear * vb.y,
-        z: -db.z * Math.abs(vb.z) * vb.z - tune.dragLinear * vb.z
-    };
-    force = FPV.add(force, FPV.qRotate(s.q, dragB));
+    force = FPV.add(force, FPV.dragForce(s.q, s.vel, tune));
 
     // --- integrate (semi-implicit Euler) -------------------------------------
     s.vel = FPV.add(s.vel, FPV.scale(force, dt / m));

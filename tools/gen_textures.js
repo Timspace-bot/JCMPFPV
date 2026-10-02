@@ -123,10 +123,24 @@ function droneSide(u, v) {
     return null;
 }
 
+// Impact flash: hot core fading through orange to transparent, with spikes.
+function explosion(u, v) {
+    const dx = u - 0.5, dy = v - 0.5;
+    const r = Math.sqrt(dx * dx + dy * dy) * 2;
+    const ang = Math.atan2(dy, dx);
+    const spikes = 0.82 + 0.18 * Math.pow(Math.abs(Math.sin(ang * 5 + 0.7) * Math.cos(ang * 3)), 0.5);
+    const e = r / spikes;
+    if (e >= 1) { return null; }
+    const core = Math.max(0, 1 - e / 0.35);
+    const col = [255, Math.round(120 + 135 * core), Math.round(30 + 200 * core * core)];
+    return [col[0], col[1], col[2], Math.round(255 * Math.pow(1 - e, 0.7))];
+}
+
 function main() {
     fs.mkdirSync(OUT, { recursive: true });
     fs.writeFileSync(path.join(OUT, 'drone_top.png'), png(128, 128, raster(128, 128, droneTop)));
     fs.writeFileSync(path.join(OUT, 'drone_side.png'), png(128, 32, raster(128, 32, droneSide)));
+    fs.writeFileSync(path.join(OUT, 'explosion.png'), png(128, 128, raster(128, 128, explosion)));
     console.log('wrote textures to ' + path.relative(process.cwd(), OUT));
 }
 

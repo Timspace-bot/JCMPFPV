@@ -36,6 +36,34 @@ module.exports = {
     // point (purely cosmetic).
     videoRange: 2500,
 
+    // AI wingmen. Pilots call them in with a button, they fly in formation,
+    // circle (at least orbitMinHeight above the target) while the pilot dives,
+    // and take over control when the pilot's drone impacts.
+    swarm: {
+        enabled: true,
+        maxWingmen: 5,
+        orbitMinHeight: 25,     // metres above the attack point
+        orbitRadius: 35,
+        orbitSpeed: 11,
+        formationMinHeight: 4,
+        cruiseSpeed: 45,
+        attackSpeed: 40,
+        attackRadius: 150,      // swarm-attack picks targets within this range of the pilot's drone
+        wreckSeconds: 15
+    },
+
+    // What a drone impact does. Damage is applied server-side around the
+    // impact point (player health is 0-800 in JC3MP).
+    damage: {
+        enabled: true,
+        minSpeed: 10,           // m/s - slower crashes do nothing
+        radius: 6,              // metres
+        playerDamage: 350,      // at the centre, falls off linearly to the edge
+        vehicleDamage: 0.4,     // fraction of the vehicle's max health at the centre
+        hitDrones: true,        // impacts also knock down other pilots' drones in range
+        hitPilotsOwnDrones: false
+    },
+
     // Force physics values on every client (same keys as DEFAULT_TUNE in
     // src/client/physics.js), e.g. { thrustToWeight: 6, battery: { enabled: false } }.
     tuneOverrides: {}

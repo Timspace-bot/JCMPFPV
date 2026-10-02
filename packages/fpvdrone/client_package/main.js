@@ -203,6 +203,45 @@ FPV.wrapAngle = function (a) {
     return a;
 };
 
+// Quaternion from orthonormal body axes expressed in world space
+// (columns of the rotation matrix).
+FPV.quatFromBasis = function (X, Y, Z) {
+    const m00 = X.x, m01 = Y.x, m02 = Z.x;
+    const m10 = X.y, m11 = Y.y, m12 = Z.y;
+    const m20 = X.z, m21 = Y.z, m22 = Z.z;
+    const tr = m00 + m11 + m22;
+    let q;
+    if (tr > 0) {
+        const s = Math.sqrt(tr + 1) * 2;
+        q = { w: 0.25 * s, x: (m21 - m12) / s, y: (m02 - m20) / s, z: (m10 - m01) / s };
+    } else if (m00 > m11 && m00 > m22) {
+        const s = Math.sqrt(1 + m00 - m11 - m22) * 2;
+        q = { w: (m21 - m12) / s, x: 0.25 * s, y: (m01 + m10) / s, z: (m02 + m20) / s };
+    } else if (m11 > m22) {
+        const s = Math.sqrt(1 + m11 - m00 - m22) * 2;
+        q = { w: (m02 - m20) / s, x: (m01 + m10) / s, y: 0.25 * s, z: (m12 + m21) / s };
+    } else {
+        const s = Math.sqrt(1 + m22 - m00 - m11) * 2;
+        q = { w: (m10 - m01) / s, x: (m02 + m20) / s, y: (m12 + m21) / s, z: 0.25 * s };
+    }
+    return FPV.qNorm(q);
+};
+
+// Attitude whose forward (-Z) points along `dir`, with no roll.
+FPV.lookRotation = function (dir) {
+    const n = FPV.norm(dir);
+    const yaw = Math.atan2(-n.x, -n.z);
+    const pitch = Math.asin(FPV.clamp(n.y, -1, 1));
+    return FPV.qMul(FPV.qAxisAngle({ x: 0, y: 1, z: 0 }, yaw), FPV.qAxisAngle({ x: 1, y: 0, z: 0 }, pitch));
+};
+
+FPV.clampLen = function (v, max) {
+    const l = FPV.len(v);
+    return l > max ? FPV.scale(v, max / l) : v;
+};
+
+FPV.horiz = function (v) { return { x: v.x, y: 0, z: v.z }; };
+
 // ===== physics.js =====
 // ---------------------------------------------------------------------------
 // physics.js - a small rigid-body quadcopter model with a Betaflight-style
@@ -306,6 +345,7 @@ FPV.yawOf = function (q) {
 
 // Desired body rates (rad/s) for the current stick input and flight mode.
 FPV.desiredRates = function (s, input, tune) {
+    if (input.mode === 'direct') { return input.wDes; }   // autopilot (swarm wingmen)
     const R = tune.rates;
     const acro = {
         x: -FPV.bfRate(input.pitch, R.pitch) * FPV.DEG,  // stick forward -> nose down
@@ -342,6 +382,7 @@ FPV.desiredRates = function (s, input, tune) {
 
 FPV.motorCommand = function (s, input, tune) {
     if (!s.armed || s.crashed) { return 0; }
+    if (input.mode === 'direct') { return FPV.clamp(input.thrustCmd, tune.idleThrottle, 1); }
     const thrust = FPV.throttleCurve(input.throttle, tune.throttleMid, tune.throttleExpo);
     if (input.altHold && input.mode !== 'acro') {
         // Throttle stick commands a climb rate; centre stick = hover.
@@ -367,6 +408,17 @@ FPV.updateBattery = function (s, tune, dt) {
     s.cellVoltage = Math.max(2.8, rest - packSag / b.cells);
     if (charge <= 0) { return 0.3; }
     return 0.75 + 0.25 * FPV.clamp((rest - 3.3) / 0.9, 0, 1);
+};
+
+// Aerodynamic drag (world frame, Newtons) for attitude q moving at vel.
+FPV.dragForce = function (q, vel, tune) {
+    const vb = FPV.qRotate(FPV.qConj(q), vel);
+    const db = tune.dragBody;
+    return FPV.qRotate(q, {
+        x: -db.x * Math.abs(vb.x) * vb.x - tune.dragLinear * vb.x,
+        y: -db.y * Math.abs(vb.y) * vb.y - tune.dragLinear * vb.y,
+        z: -db.z * Math.abs(vb.z) * vb.z - tune.dragLinear * vb.z
+    });
 };
 
 FPV.crash = function (s, reason) {
@@ -405,14 +457,7 @@ FPV.step = function (s, input, env, tune, dt) {
     let force = FPV.scale(up, s.motor * maxThrust * battFactor);
     force.y -= m * g;
 
-    const vb = FPV.qRotate(FPV.qConj(s.q), s.vel);
-    const db = tune.dragBody;
-    const dragB = {
-        x: -db.x * Math.abs(vb.x) * vb.x - tune.dragLinear * vb.x,
-        y: -db.y * Math.abs(vb.y) * vb.y - tune.dragLinear * vb.y,
-        z: -db.z * Math.abs(vb.z) * vb.z - tune.dragLinear * vb.z
-    };
-    force = FPV.add(force, FPV.qRotate(s.q, dragB));
+    force = FPV.add(force, FPV.dragForce(s.q, s.vel, tune));
 
     // --- integrate (semi-implicit Euler) -------------------------------------
     s.vel = FPV.add(s.vel, FPV.scale(force, dt / m));
@@ -583,37 +628,441 @@ FPV.World.prototype.probe = function (camPos, camFwd, hit) {
     return dist;
 };
 
+// ===== swarm.js =====
+// ---------------------------------------------------------------------------
+// swarm.js - AI wingmen that fly the same physics model as the player.
+//
+// Behaviours (per wingman `role`):
+//   join   - fly to a slot in a dynamic formation around the controlled drone:
+//            a wedge behind it when it is moving, a slow ring when it hovers.
+//   orbit  - "support": circle the point the player is diving at, at least
+//            `orbitMinHeight` above it, cameras facing the centre, so one of
+//            them can take over straight after the player's drone impacts.
+//   attack - pursue and ram an assigned target (proportional lead).
+//   aim    - handover: pitch so the FPV camera points at a spot, then the
+//            client gives this drone to the player.
+//   wreck  - crashed; falls and is removed after a while.
+//
+// All pure JS: the client supplies the leader state, a floor lookup and a
+// target list; the swarm returns events (impacts, losses).
+// ---------------------------------------------------------------------------
+
+FPV.SWARM_DEFAULTS = {
+    maxWingmen: 5,
+    formationMinHeight: 4,   // m above known ground while in formation
+    orbitMinHeight: 25,      // m above the attack point while circling
+    orbitRadius: 35,
+    orbitSpeed: 11,          // m/s tangential
+    cruiseSpeed: 45,         // m/s max transit speed
+    attackSpeed: 40,
+    attackRadius: 150,       // targets are picked within this range of the leader
+    hitRadius: 2.2,
+    wreckSeconds: 15,
+    impactMinSpeed: 10       // m/s - slower crashes do no damage
+};
+
+FPV.SWARM_STEP = 1 / 120;
+
+// Turn a guidance command into direct rate/thrust input for FPV.step.
+//   cmd.vel        desired world velocity
+//   cmd.face       world direction the nose (or camera, with aimCamera) should face
+//   cmd.aimCamera  point the tilted FPV camera along cmd.face instead of the nose
+//   cmd.aimThrust  thrust fraction to hold while aiming
+FPV.autopilot = function (s, cmd, tune) {
+    const g = tune.gravity;
+    const maxAcc = tune.thrustToWeight * g;
+    let qDes;
+    let thrust;
+
+    if (cmd.aimCamera) {
+        const tilt = FPV.qAxisAngle({ x: 1, y: 0, z: 0 }, -tune.cameraTiltDeg * FPV.DEG);
+        qDes = FPV.qMul(FPV.lookRotation(cmd.face), tilt);
+        thrust = cmd.aimThrust !== undefined ? cmd.aimThrust : 1 / tune.thrustToWeight;
+    } else {
+        let a = FPV.scale(FPV.sub(cmd.vel, s.vel), cmd.velGain || 2.5);
+        // Feed-forward the drag we will meet at the commanded speed.
+        a = FPV.sub(a, FPV.scale(FPV.dragForce(s.q, cmd.vel, tune), 1 / tune.massKg));
+        const aMax = cmd.maxAccel || 24;
+        const ah = Math.sqrt(a.x * a.x + a.z * a.z);
+        if (ah > aMax) { a.x *= aMax / ah; a.z *= aMax / ah; }
+        const f = { x: a.x, y: FPV.clamp(a.y, -0.75 * g, maxAcc) + g, z: a.z };
+        const maxTilt = (cmd.maxTiltDeg || 60) * FPV.DEG;
+        const fh = Math.sqrt(f.x * f.x + f.z * f.z);
+        if (fh > 1e-6 && Math.atan2(fh, f.y) > maxTilt) {
+            const k = f.y * Math.tan(maxTilt) / fh;
+            f.x *= k; f.z *= k;
+        }
+        const fl = FPV.len(f);
+        const up = FPV.scale(f, 1 / fl);
+        thrust = fl / maxAcc;
+
+        let fwd = cmd.face && FPV.len(FPV.horiz(cmd.face)) > 1e-3 ? cmd.face : FPV.qRotate(s.q, { x: 0, y: 0, z: -1 });
+        let proj = FPV.sub(fwd, FPV.scale(up, FPV.dot(fwd, up)));
+        if (FPV.len(proj) < 1e-3) { proj = FPV.qRotate(s.q, { x: 0, y: 0, z: -1 }); }
+        const Z = FPV.scale(FPV.norm(proj), -1);
+        const X = FPV.norm(FPV.cross(up, Z));
+        qDes = FPV.quatFromBasis(X, up, FPV.cross(X, up));
+    }
+
+    let err = FPV.qMul(FPV.qConj(s.q), qDes);
+    if (err.w < 0) { err = { x: -err.x, y: -err.y, z: -err.z, w: -err.w }; }
+    const aa = FPV.qToAxisAngle(err);
+    const gain = 9;
+    const w = FPV.clampLen(FPV.scale(aa.axis, aa.angle * gain), 14);
+    return { mode: 'direct', wDes: w, thrustCmd: FPV.clamp(thrust, 0, 1), throttle: 0, roll: 0, pitch: 0, yaw: 0 };
+};
+
+FPV.Swarm = function (opts, tune) {
+    this.opts = {};
+    for (const k in FPV.SWARM_DEFAULTS) { this.opts[k] = FPV.SWARM_DEFAULTS[k]; }
+    this.configure(opts);
+    this.setTune(tune || FPV.DEFAULT_TUNE);
+    this.wingmen = [];
+    this.nextId = 1;
+    this.mode = 'formation';     // formation | support
+    this.center = null;          // support orbit centre
+    this.supportSince = 0;
+    this.diveTime = 0;
+    this.time = 0;
+    this.acc = 0;
+    this.events = [];
+};
+
+FPV.Swarm.prototype.configure = function (opts) {
+    if (!opts) { return; }
+    for (const k in this.opts) {
+        if (typeof opts[k] === 'number' && isFinite(opts[k])) { this.opts[k] = opts[k]; }
+    }
+};
+
+FPV.Swarm.prototype.setTune = function (tune) {
+    this.tune = FPV.cloneTune(tune);
+    this.tune.battery.enabled = false;   // wingmen don't run out mid-fight
+};
+
+FPV.Swarm.prototype.flying = function () {
+    return this.wingmen.filter(function (w) { return w.role !== 'wreck'; });
+};
+
+FPV.Swarm.prototype.attackers = function () {
+    return this.wingmen.filter(function (w) { return w.role === 'attack'; });
+};
+
+FPV.Swarm.prototype.add = function (state, role, id) {
+    const w = {
+        id: id !== undefined ? id : this.nextId++,
+        s: state,
+        role: role || 'join',
+        target: null,
+        aimPoint: null,
+        phase: Math.random() * Math.PI * 2,
+        age: 0,
+        input: null
+    };
+    if (w.id >= this.nextId) { this.nextId = w.id + 1; }
+    this.wingmen.push(w);
+    return w;
+};
+
+// Launch a new wingman from `pos` (it takes off and flies to the formation).
+FPV.Swarm.prototype.spawn = function (pos, q) {
+    if (this.flying().length >= this.opts.maxWingmen) { return null; }
+    const s = FPV.createState(pos, q);
+    s.armed = true;
+    s.onGround = true;
+    return this.add(s, 'join');
+};
+
+FPV.Swarm.prototype.remove = function (w) {
+    const i = this.wingmen.indexOf(w);
+    if (i >= 0) { this.wingmen.splice(i, 1); }
+};
+
+FPV.Swarm.prototype.wreck = function (s, id) {
+    const w = this.add(s, 'wreck', id);
+    w.age = 0;
+    return w;
+};
+
+// Circle `point` (e.g. where the player just crashed).
+FPV.Swarm.prototype.focus = function (point) {
+    this.mode = 'support';
+    this.center = { x: point.x, y: point.y, z: point.z };
+    this.supportSince = this.time;
+    this.wingmen.forEach(function (w) { if (w.role === 'join') { w.role = 'orbit'; } });
+};
+
+FPV.Swarm.prototype.predictImpact = function (L, env) {
+    const ground = env.floorAt({ x: L.pos.x, y: L.pos.y, z: L.pos.z }).y;
+    const t = FPV.clamp((L.pos.y - ground) / Math.max(-L.vel.y, 1), 0, 6);
+    const p = FPV.add(L.pos, FPV.scale(L.vel, t));
+    p.y = Math.max(env.floorAt({ x: p.x, y: L.pos.y, z: p.z }).y, ground - 50);
+    return p;
+};
+
+FPV.Swarm.prototype.updateMode = function (dt, leader, env) {
+    if (!leader || leader.crashed) { return; }
+    const sp = FPV.len(leader.vel);
+    const diving = sp > 8 && leader.vel.y / sp < -0.35;
+    this.diveTime = diving ? this.diveTime + dt : 0;
+
+    if (this.mode === 'formation' && this.diveTime > 0.3) {
+        this.focus(this.predictImpact(leader, env));
+    } else if (this.mode === 'support') {
+        if (diving) {
+            const p = this.predictImpact(leader, env);
+            this.center = FPV.lerp3(this.center, p, 1 - Math.exp(-dt * 3));
+        }
+        const climbedOut = !diving && leader.vel.y > 2 &&
+            leader.pos.y > this.center.y + this.opts.orbitMinHeight * 0.8;
+        const farAway = FPV.len(FPV.horiz(FPV.sub(leader.pos, this.center))) > this.opts.orbitRadius * 4;
+        if (this.time - this.supportSince > 3 && (climbedOut || farAway)) {
+            this.mode = 'formation';
+            this.center = null;
+            this.wingmen.forEach(function (w) { if (w.role === 'orbit') { w.role = 'join'; } });
+        }
+    }
+};
+
+FPV.Swarm.prototype.groundBelow = function (env, p) {
+    return env.floorAt({ x: p.x, y: p.y + 50, z: p.z }).y;
+};
+
+FPV.Swarm.prototype.formationCmd = function (w, idx, n, leader, env) {
+    const o = this.opts;
+    const L = leader;
+    const hv = FPV.horiz(L.vel);
+    const sp = FPV.len(hv);
+    let dir = sp > 1 ? FPV.norm(hv) : FPV.norm(FPV.horiz(FPV.qRotate(L.q, { x: 0, y: 0, z: -1 })));
+    if (FPV.len(dir) < 0.5) { dir = { x: 0, y: 0, z: -1 }; }
+    const right = { x: -dir.z, y: 0, z: dir.x };
+    const k = FPV.clamp((sp - 2) / 4, 0, 1);
+    const blend = k * k * (3 - 2 * k);
+    const t = this.time;
+
+    const rank = Math.floor(idx / 2) + 1;
+    const side = idx % 2 ? 1 : -1;
+    const spacing = 5 + sp * 0.3;
+    const wedge = FPV.add(FPV.add(FPV.scale(right, side * rank * spacing * 0.9), FPV.scale(dir, -rank * spacing * 0.7)),
+        { x: 0, y: 1.5 + rank * 0.7, z: 0 });
+    const ang = 2 * Math.PI * idx / Math.max(n, 1) + t * 0.15;
+    const rad = 7 + n * 0.8;
+    const ring = { x: Math.cos(ang) * rad, y: 3 + 0.5 * Math.sin(t * 0.8 + w.phase), z: Math.sin(ang) * rad };
+    const wobble = { x: Math.sin(t * 0.7 + w.phase) * 0.6, y: Math.sin(t * 1.1 + w.phase) * 0.4, z: Math.cos(t * 0.9 + w.phase) * 0.6 };
+
+    const slot = FPV.add(FPV.add(L.pos, FPV.lerp3(ring, wedge, blend)), wobble);
+    slot.y = Math.max(slot.y, this.groundBelow(env, slot) + o.formationMinHeight);
+
+    const toSlot = FPV.sub(slot, w.s.pos);
+    const dist = FPV.len(toSlot);
+    const vel = FPV.clampLen(FPV.add(L.vel, FPV.clampLen(FPV.scale(toSlot, 1.2), o.cruiseSpeed)), o.cruiseSpeed + sp);
+    let face;
+    if (dist > 25) { face = toSlot; }
+    else if (blend > 0.5) { face = dir; }
+    else { face = FPV.horiz(FPV.sub(slot, L.pos)); }
+    return { vel: vel, face: face, maxTiltDeg: dist > 25 ? 65 : 50 };
+};
+
+FPV.Swarm.prototype.orbitCmd = function (w, idx, n, env) {
+    const o = this.opts;
+    const c = this.center;
+    const t = this.time;
+    const R = o.orbitRadius + 4 * Math.sin(t * 0.3 + w.phase);
+    const omega = o.orbitSpeed / o.orbitRadius;
+    const th = t * omega + 2 * Math.PI * idx / Math.max(n, 1);
+    const groundC = Math.max(c.y, this.groundBelow(env, c));
+    const slot = {
+        x: c.x + Math.cos(th) * R,
+        y: groundC + o.orbitMinHeight + 3 * Math.sin(t * 0.5 + w.phase),
+        z: c.z + Math.sin(th) * R
+    };
+    slot.y = Math.max(slot.y, this.groundBelow(env, slot) + o.formationMinHeight);
+    const tangent = { x: -Math.sin(th) * R * omega, y: 0, z: Math.cos(th) * R * omega };
+    const vel = FPV.add(tangent, FPV.clampLen(FPV.scale(FPV.sub(slot, w.s.pos), 1.0), 30));
+    return { vel: FPV.clampLen(vel, o.cruiseSpeed), face: FPV.horiz(FPV.sub(c, w.s.pos)), maxTiltDeg: 55 };
+};
+
+FPV.Swarm.prototype.attackCmd = function (w) {
+    const T = w.target;
+    const d = FPV.sub(T.pos, w.s.pos);
+    const dist = FPV.len(d);
+    const closing = Math.max(FPV.len(w.s.vel), 10);
+    const tgo = Math.min(dist / closing, 3);
+    const aim = FPV.add(T.pos, FPV.scale(T.vel || { x: 0, y: 0, z: 0 }, tgo));
+    const dir = FPV.norm(FPV.sub(aim, w.s.pos));
+    return { vel: FPV.scale(dir, this.opts.attackSpeed), face: dir, velGain: 3.5, maxTiltDeg: 80, maxAccel: 40 };
+};
+
+// Send every flying wingman (or `count` of them) at targets near the leader.
+// targets: [{key, pos, vel}] - returns how many wingmen were tasked.
+FPV.Swarm.prototype.attack = function (targets, leaderPos) {
+    const o = this.opts;
+    const inRange = targets.filter(function (t) { return FPV.dist(t.pos, leaderPos) <= o.attackRadius; });
+    if (!inRange.length) { return 0; }
+    const free = this.wingmen.filter(function (w) { return w.role === 'join' || w.role === 'orbit'; });
+    let n = 0;
+    free.forEach(function (w, i) {
+        // Nearest targets first, spread round-robin across wingmen.
+        const sorted = inRange.slice().sort(function (a, b) { return FPV.dist(a.pos, w.s.pos) - FPV.dist(b.pos, w.s.pos); });
+        w.target = sorted[i % sorted.length];
+        w.role = 'attack';
+        n++;
+    });
+    return n;
+};
+
+FPV.Swarm.prototype.recall = function () {
+    this.wingmen.forEach(function (w) { if (w.role === 'attack') { w.role = 'join'; w.target = null; } });
+};
+
+// Best airborne wingman to take over, judged by how close its camera already
+// is to looking at `point`. Returns null if none qualifies.
+FPV.Swarm.prototype.pickHandover = function (point) {
+    let best = null;
+    let bestScore = Infinity;
+    const tune = this.tune;
+    this.wingmen.forEach(function (w) {
+        if (w.role === 'wreck' || w.role === 'attack' || w.s.crashed || w.s.onGround) { return; }
+        const d = FPV.sub(point, w.s.pos);
+        const dist = FPV.len(d);
+        if (dist < 6 || dist > 600) { return; }
+        const camF = FPV.qRotate(FPV.cameraPose(w.s, tune).q, { x: 0, y: 0, z: -1 });
+        const ang = Math.acos(FPV.clamp(FPV.dot(FPV.norm(d), camF), -1, 1));
+        const hd = FPV.norm(FPV.horiz(d)), hc = FPV.norm(FPV.horiz(camF));
+        const yawAng = Math.acos(FPV.clamp(FPV.dot(hd, hc), -1, 1));
+        const above = w.s.pos.y - point.y > 3 ? 0 : 1.5;
+        const score = yawAng + ang * 0.5 + Math.abs(dist - 45) / 150 + above;
+        if (score < bestScore) { bestScore = score; best = w; }
+    });
+    return best;
+};
+
+FPV.Swarm.prototype.aimError = function (w) {
+    const camF = FPV.qRotate(FPV.cameraPose(w.s, this.tune).q, { x: 0, y: 0, z: -1 });
+    return Math.acos(FPV.clamp(FPV.dot(FPV.norm(FPV.sub(w.aimPoint, w.s.pos)), camF), -1, 1));
+};
+
+function segPointDist(a, b, p) {
+    const ab = FPV.sub(b, a);
+    const l2 = FPV.dot(ab, ab);
+    const t = l2 > 1e-9 ? FPV.clamp(FPV.dot(FPV.sub(p, a), ab) / l2, 0, 1) : 0;
+    return FPV.dist(FPV.add(a, FPV.scale(ab, t)), p);
+}
+
+// Advance all wingmen. leader: controlled drone state (or null).
+// targets: {key: {key,pos,vel}} currently known targets.
+FPV.Swarm.prototype.update = function (dt, leader, env, targets) {
+    const self = this;
+    const o = this.opts;
+    this.time += dt;
+    this.updateMode(dt, leader, env);
+
+    // Re-target or stand down attackers whose target vanished.
+    this.wingmen.forEach(function (w) {
+        if (w.role !== 'attack') { return; }
+        const t = targets && targets[w.target.key];
+        if (t) { w.target = t; } else { w.role = self.mode === 'support' ? 'orbit' : 'join'; w.target = null; }
+    });
+
+    const members = this.wingmen.filter(function (w) { return w.role === 'join' || w.role === 'orbit'; });
+    const nullInput = { mode: 'direct', wDes: { x: 0, y: 0, z: 0 }, thrustCmd: 0 };
+
+    const prev = {};
+    this.wingmen.forEach(function (w) {
+        prev[w.id] = { x: w.s.pos.x, y: w.s.pos.y, z: w.s.pos.z };
+        w.cmd = null;
+        if (w.role === 'wreck' || w.s.crashed) { return; }
+        const idx = members.indexOf(w);
+        if (w.role === 'attack') { w.cmd = self.attackCmd(w); }
+        else if (w.role === 'aim') { w.cmd = { aimCamera: true, face: FPV.sub(w.aimPoint, w.s.pos), aimThrust: 0.22 }; }
+        else if (self.mode === 'support' && self.center) { w.role = 'orbit'; w.cmd = self.orbitCmd(w, idx, members.length, env); }
+        else if (leader) { w.role = 'join'; w.cmd = self.formationCmd(w, idx, members.length, leader, env); }
+        else { w.cmd = { vel: { x: 0, y: 0, z: 0 }, face: null }; }
+    });
+
+    this.acc += dt;
+    while (this.acc >= FPV.SWARM_STEP) {
+        this.acc -= FPV.SWARM_STEP;
+        this.wingmen.forEach(function (w) {
+            const input = w.cmd && !w.s.crashed ? FPV.autopilot(w.s, w.cmd, self.tune) : nullInput;
+            FPV.step(w.s, input, env, self.tune, FPV.SWARM_STEP);
+        });
+    }
+
+    const keep = [];
+    this.wingmen.forEach(function (w) {
+        w.age += dt;
+        if (w.role === 'attack' && !w.s.crashed &&
+            segPointDist(prev[w.id], w.s.pos, w.target.pos) <= o.hitRadius) {
+            const speed = FPV.len(w.s.vel);
+            FPV.crash(w.s, 'IMPACT');
+            w.hit = true;
+            self.events.push({ type: 'impact', id: w.id, pos: w.target.pos, speed: speed, target: w.target.key });
+        }
+        while (w.s.events.length) {
+            const ev = w.s.events.shift();
+            if (ev.type !== 'crash' || w.role === 'wreck') { continue; }
+            if (!w.hit) {
+                self.events.push({ type: 'lost', id: w.id, reason: ev.reason, pos: w.s.pos });
+                if (ev.speed >= o.impactMinSpeed && ev.reason !== 'WATER' && ev.reason !== 'HIT') {
+                    self.events.push({ type: 'impact', id: w.id, pos: w.s.pos, speed: ev.speed, target: null });
+                }
+            }
+            w.role = 'wreck';
+            w.age = 0;
+            w.target = null;
+        }
+        if (!(w.role === 'wreck' && w.age > o.wreckSeconds)) { keep.push(w); }
+    });
+    this.wingmen = keep;
+};
+
 // ===== remote.js =====
 // ---------------------------------------------------------------------------
-// remote.js - other players' drones: snapshot buffer, interpolation, drawing.
+// remote.js - other players' drones (snapshot buffer + interpolation) and the
+// renderer used for every drone that is not the one we are looking through.
 // ---------------------------------------------------------------------------
 
 FPV.INTERP_DELAY_MS = 120;
 FPV.REMOTE_TIMEOUT_MS = 4000;
 
+FPV.FLAG_ARMED = 1;
+FPV.FLAG_CONTROLLED = 2;
+FPV.FLAG_CRASHED = 4;
+
 FPV.Remotes = function () {
-    this.list = {};   // networkId -> remote
+    this.list = {};    // "pilotId:droneId" -> remote drone
+    this.pilots = {};  // pilotId -> name (pilots currently flying)
 };
 
-FPV.Remotes.prototype.ensure = function (id, name) {
-    let r = this.list[id];
-    if (!r) {
-        r = this.list[id] = { id: id, name: name || ('Pilot ' + id), snaps: [], last: 0, pose: null, armed: false, throttle: 0 };
+FPV.Remotes.prototype.addPilot = function (pilotId, name) { this.pilots[pilotId] = name; };
+
+FPV.Remotes.prototype.removePilot = function (pilotId) {
+    delete this.pilots[pilotId];
+    const prefix = pilotId + ':';
+    for (const k in this.list) { if (k.indexOf(prefix) === 0) { delete this.list[k]; } }
+};
+
+FPV.Remotes.prototype.clear = function () { this.list = {}; this.pilots = {}; };
+
+// entries: [[droneId, x, y, z, qx, qy, qz, qw, flags], ...] for one pilot.
+FPV.Remotes.prototype.pushSwarm = function (pilotId, now, entries) {
+    const seen = {};
+    for (let i = 0; i < entries.length; i++) {
+        const e = entries[i];
+        const key = pilotId + ':' + e[0];
+        seen[key] = true;
+        let r = this.list[key];
+        if (!r) { r = this.list[key] = { key: key, pilot: pilotId, id: e[0], snaps: [], last: 0, pose: null, flags: 0 }; }
+        r.snaps.push({ t: now, pos: { x: e[1], y: e[2], z: e[3] }, q: FPV.qNorm({ x: e[4], y: e[5], z: e[6], w: e[7] }) });
+        if (r.snaps.length > 20) { r.snaps.shift(); }
+        r.last = now;
+        r.flags = e[8];
     }
-    if (name) { r.name = name; }
-    return r;
-};
-
-FPV.Remotes.prototype.remove = function (id) { delete this.list[id]; };
-FPV.Remotes.prototype.clear = function () { this.list = {}; };
-
-FPV.Remotes.prototype.push = function (id, now, pos, q, armed, throttle) {
-    const r = this.ensure(id);
-    r.snaps.push({ t: now, pos: pos, q: FPV.qNorm(q) });
-    if (r.snaps.length > 20) { r.snaps.shift(); }
-    r.last = now;
-    r.armed = armed;
-    r.throttle = throttle;
+    const prefix = pilotId + ':';
+    for (const k in this.list) {
+        if (k.indexOf(prefix) === 0 && !seen[k]) { delete this.list[k]; }
+    }
 };
 
 // Interpolate every remote to (now - delay). Drops remotes that went quiet.
@@ -638,6 +1087,11 @@ FPV.Remotes.prototype.update = function (now) {
             const k = FPV.clamp((t - a.t) / Math.max(b.t - a.t, 1), 0, 1);
             r.pose = { pos: FPV.lerp3(a.pos, b.pos, k), q: FPV.qSlerp(a.q, b.q, k) };
         }
+        // Velocity estimate for targeting.
+        if (s.length >= 2) {
+            const a = s[s.length - 2], b = s[s.length - 1];
+            r.vel = FPV.scale(FPV.sub(b.pos, a.pos), 1000 / Math.max(b.t - a.t, 1));
+        }
     }
 };
 
@@ -646,7 +1100,6 @@ FPV.Remotes.prototype.update = function (now) {
 FPV.RemoteRenderer = function () {
     this.ready = false;
     this.size = 0.5;          // drawn a bit larger than a real 5" quad so it is visible
-    this.color = new RGBA(255, 255, 255, 255);
     this.nameColor = new RGBA(255, 255, 255, 230);
     this.shadow = new RGBA(0, 0, 0, 200);
     this.armedColor = new RGBA(80, 255, 120, 230);
@@ -655,14 +1108,15 @@ FPV.RemoteRenderer = function () {
     try {
         this.texTop = new Texture('package://fpvdrone/textures/drone_top.png');
         this.texSide = new Texture('package://fpvdrone/textures/drone_side.png');
+        this.texBoom = new Texture('package://fpvdrone/textures/explosion.png');
         this.ready = true;
     } catch (e) {
-        jcmp.print && jcmp.print('[fpvdrone] could not load textures: ' + e);
+        if (typeof jcmp.print === 'function') { jcmp.print('[fpvdrone] could not load textures: ' + e); }
     }
 };
 
-// 3D pass (GameUpdateRender): textured quads at the interpolated pose.
-FPV.RemoteRenderer.prototype.draw3d = function (r, remotes, camPos, modelRotSign) {
+// 3D pass (GameUpdateRender): textured quads at each pose [{pos, q}].
+FPV.RemoteRenderer.prototype.draw3d = function (r, poses, camPos, modelRotSign) {
     if (!this.ready) { return; }
     const half = this.size / 2;
     const topPos = new Vector3f(-half, -half, 0);
@@ -670,12 +1124,11 @@ FPV.RemoteRenderer.prototype.draw3d = function (r, remotes, camPos, modelRotSign
     const sideH = this.size * 0.25;
     const sidePos = new Vector3f(-half, -sideH / 2, 0);
     const sideSize = new Vector2f(this.size, sideH);
-    for (const id in remotes.list) {
-        const rm = remotes.list[id];
-        if (!rm.pose) { continue; }
-        if (FPV.dist(rm.pose.pos, camPos) > 1500) { continue; }
-        const aa = FPV.qToAxisAngle(rm.pose.q);
-        const pos = new Vector3f(rm.pose.pos.x, rm.pose.pos.y, rm.pose.pos.z);
+    for (let i = 0; i < poses.length; i++) {
+        const p = poses[i];
+        if (FPV.dist(p.pos, camPos) > 1500 || FPV.dist(p.pos, camPos) < 0.3) { continue; }
+        const aa = FPV.qToAxisAngle(p.q);
+        const pos = new Vector3f(p.pos.x, p.pos.y, p.pos.z);
         const axis = new Vector3f(aa.axis.x, aa.axis.y, aa.axis.z);
         const angle = aa.angle * modelRotSign;
         // Matrices are rebuilt rather than reused in case Matrix ops mutate.
@@ -688,33 +1141,43 @@ FPV.RemoteRenderer.prototype.draw3d = function (r, remotes, camPos, modelRotSign
     }
 };
 
-// 2D pass (Render): name tag + distance above each drone.
-FPV.RemoteRenderer.prototype.draw2d = function (r, remotes, camPos) {
-    for (const id in remotes.list) {
-        const rm = remotes.list[id];
-        if (!rm.pose) { continue; }
-        const d = FPV.dist(rm.pose.pos, camPos);
-        if (d > 1500) { continue; }
-        const p = rm.pose.pos;
-        const sp = r.WorldToScreen(new Vector3f(p.x, p.y + 0.6, p.z));
+// 2D pass (Render): labels [{pos, text, color, size}] and impact flashes.
+FPV.RemoteRenderer.prototype.draw2d = function (r, labels, effects, camPos, now) {
+    for (let i = 0; i < labels.length; i++) {
+        const l = labels[i];
+        const d = FPV.dist(l.pos, camPos);
+        if (d > 1500 || d < 0.5) { continue; }
+        const sp = r.WorldToScreen(new Vector3f(l.pos.x, l.pos.y + 0.6, l.pos.z));
         if (!sp || (sp.x === -1 && sp.y === -1)) { continue; }
-        const text = rm.name + '  ' + Math.round(d) + 'm';
-        const size = d < 50 ? 22 : 18;
+        const text = l.text + '  ' + Math.round(d) + 'm';
+        const size = l.size || (d < 50 ? 22 : 18);
         const m = r.MeasureText(text, size, 'Arial');
         const x = sp.x - m.x / 2, y = sp.y - m.y;
         r.DrawText(text, new Vector3f(x + 1, y + 1, 0.5), this.maxText, this.shadow, size, 'Arial');
-        r.DrawText(text, new Vector3f(x, y, 0.5), this.maxText, rm.armed ? this.armedColor : this.nameColor, size, 'Arial');
+        r.DrawText(text, new Vector3f(x, y, 0.5), this.maxText, l.color || this.nameColor, size, 'Arial');
+    }
+    if (!this.ready) { return; }
+    for (let i = 0; i < effects.length; i++) {
+        const e = effects[i];
+        const age = (now - e.t0) / 1000;
+        if (age < 0 || age > 0.7) { continue; }
+        const d = Math.max(FPV.dist(e.pos, camPos), 1);
+        const sp = r.WorldToScreen(new Vector3f(e.pos.x, e.pos.y, e.pos.z));
+        if (!sp || (sp.x === -1 && sp.y === -1)) { continue; }
+        const s = FPV.clamp(2400 / d, 24, 900) * (0.4 + age * 1.6);
+        r.DrawTexture(this.texBoom, new Vector2f(sp.x - s / 2, sp.y - s / 2), new Vector2f(s, s));
     }
 };
 
 // ===== client.js =====
 // ---------------------------------------------------------------------------
 // client.js - glue between the simulation and JC3MP: camera, input from the
-// UI, networking, remote drones and the OSD feed.
+// UI, the swarm, networking, remote drones and the OSD feed.
 // ---------------------------------------------------------------------------
 
 const STEP = 1 / 240;           // physics substep
 const OSD_INTERVAL_MS = 33;
+const HANDOVER_MAX_MS = 900;    // longest the auto-aim may take before control passes
 const MODES = ['acro', 'angle', 'horizon'];
 const VIEWS = ['fpv', 'chase', 'los'];
 
@@ -728,7 +1191,9 @@ const cfg = {
     followDepth: 40,
     videoRange: 2500,
     maxAltitude: 4500,
-    tuneOverrides: {}
+    tuneOverrides: {},
+    swarm: { enabled: true },
+    damage: { enabled: true, minSpeed: 10 }
 };
 
 // Local pilot settings (edited in the F8 panel, persisted by the UI).
@@ -744,7 +1209,8 @@ let tune = FPV.cloneTune(FPV.DEFAULT_TUNE);
 
 let status = 'idle';            // idle | pending | flying
 let pendingSince = 0;
-let drone = null;
+let drone = null;               // the drone the player is flying
+let droneId = 0;                // its id within our swarm (ids are sent over the network)
 let launch = null;              // {x,y,z} where the pilot is standing
 let lastFollow = null;
 let lastFrame = 0;
@@ -761,16 +1227,27 @@ let chaseYaw = 0;
 let videoGlitchUntil = 0;
 let armSwitchPrev = null;
 let armBlockedReason = '';
+let handover = null;            // {w, t0, point} while a wingman auto-aims before we take it
+let banner = null;              // {text, until} short OSD banner
+const effects = [];             // impact flashes [{pos, t0}]
+const targetTracks = {};        // key -> {pos, t} for velocity estimates
 
 const input = { throttle: 0, roll: 0, pitch: 0, yaw: 0, mode: 'acro', altHold: false, source: 'keyboard' };
 
 const world = new FPV.World(cfg.seaLevel);
 const remotes = new FPV.Remotes();
 const renderer = new FPV.RemoteRenderer();
+let swarm = new FPV.Swarm({}, tune);
 
 const ui = new WebUIWindow('fpvdrone', 'package://fpvdrone/ui/index.html',
     new Vector2(jcmp.viewportSize.x, jcmp.viewportSize.y));
 ui.autoResize = true;
+
+const COLOR_WING = new RGBA(90, 220, 255, 230);
+const COLOR_ATTACK = new RGBA(255, 90, 70, 240);
+const COLOR_WRECK = new RGBA(150, 150, 150, 200);
+const COLOR_ARMED = new RGBA(80, 255, 120, 230);
+const COLOR_NAME = new RGBA(255, 255, 255, 230);
 
 function log(msg) {
     if (typeof jcmp.print === 'function') { jcmp.print('[fpvdrone] ' + msg); }
@@ -780,13 +1257,22 @@ function notify(text, kind) {
     jcmp.ui.CallEvent('fpv/notify', text, kind || 'info');
 }
 
+function showBanner(text, ms) {
+    banner = { text: text, until: Date.now() + (ms || 1500) };
+}
+
 function toVec3f(v) { return new Vector3f(v.x, v.y, v.z); }
 function fromVec3f(v) { return { x: v.x, y: v.y, z: v.z }; }
 
 function rebuildTune() {
     tune = FPV.cloneTune(settings.tune);
     FPV.mergeTune(tune, cfg.tuneOverrides);
+    swarm.setTune(tune);
+    swarm.configure(cfg.swarm);
+    swarm.opts.impactMinSpeed = cfg.damage.minSpeed;
 }
+
+function swarmEnabled() { return cfg.swarm.enabled !== false; }
 
 // ---- start / stop ----------------------------------------------------------
 
@@ -806,12 +1292,15 @@ function begin() {
 
     world.seaLevel = cfg.seaLevel;
     world.reset();
-    world.addPad(launch.x, launch.y, launch.z, 4.0);
+    world.addPad(launch.x, launch.y, launch.z, 6.0);
 
+    swarm = new FPV.Swarm({}, tune);
     rebuildTune();
     const start = FPV.add(launch, { x: fwd.x * 1.5, y: tune.collisionRadius, z: fwd.z * 1.5 });
     drone = FPV.createState(start, heading);
     drone.onGround = true;
+    droneId = 0;
+    handover = null;
 
     savedFov = lp.camera.fieldOfView;
     lp.frozen = true;
@@ -843,12 +1332,15 @@ function end(tellServer) {
     lp.controlsEnabled = !chatOpen && !menuOpen;
     if (typeof jcmp.ui.ShowHud === 'function') { jcmp.ui.ShowHud(); }
     drone = null;
+    handover = null;
+    swarm = new FPV.Swarm({}, tune);
     jcmp.ui.CallEvent('fpv/active', false);
     if (tellServer) { jcmp.events.CallRemote('fpv/stop'); }
 }
 
 function resetDrone() {
     if (!drone || !launch) { return; }
+    if (handover) { finishHandover(); }
     const heading = FPV.qAxisAngle({ x: 0, y: 1, z: 0 }, FPV.yawOf(drone.q));
     const fwd = FPV.qRotate(heading, { x: 0, y: 0, z: -1 });
     drone = FPV.createState(FPV.add(launch, { x: fwd.x * 1.5, y: tune.collisionRadius, z: fwd.z * 1.5 }), heading);
@@ -862,8 +1354,10 @@ function resetDrone() {
 // ---- arming / commands -----------------------------------------------------
 
 function armRequest(on) {
-    if (!drone) { return; }
+    if (!drone || handover) { return; }
     if (!on) { FPV.disarm(drone); return; }
+    input.mode = settings.mode;
+    input.altHold = settings.altHold;
     const reason = FPV.tryArm(drone, input);
     if (reason) {
         armBlockedReason = reason;
@@ -898,33 +1392,164 @@ function command(name) {
             settings.view = VIEWS[(VIEWS.indexOf(settings.view) + 1) % VIEWS.length];
             jcmp.ui.CallEvent('fpv/view_changed', settings.view);
             break;
+        case 'call':
+            callWingman();
+            break;
+        case 'attack':
+            swarmAttack();
+            break;
+        case 'switch':
+            switchDrone();
+            break;
     }
+}
+
+// ---- swarm -----------------------------------------------------------------
+
+// Launch a wingman. Near home it lifts off from the launch pad; far away it
+// arrives from behind and above (as if dispatched from a nearby truck).
+function callWingman() {
+    if (!drone || status !== 'flying') { return; }
+    if (!swarmEnabled()) { notify('Swarm is disabled on this server', 'warn'); return; }
+    const n = swarm.flying().length;
+    let pos;
+    if (FPV.dist(launch, drone.pos) < 600) {
+        const a = n * 1.3;
+        pos = { x: launch.x + Math.cos(a) * 3, y: launch.y + tune.collisionRadius, z: launch.z + Math.sin(a) * 3 };
+    } else {
+        const back = FPV.qRotate(FPV.qAxisAngle({ x: 0, y: 1, z: 0 }, FPV.yawOf(drone.q)), { x: 0, y: 0, z: 150 });
+        pos = FPV.add(drone.pos, { x: back.x, y: 30, z: back.z });
+    }
+    const w = swarm.spawn(pos, FPV.qAxisAngle({ x: 0, y: 1, z: 0 }, FPV.yawOf(drone.q)));
+    if (!w) { notify('Swarm full (' + swarm.opts.maxWingmen + ' wingmen)', 'warn'); return; }
+    if (pos.y > launch.y + 5) { w.s.onGround = false; }
+    notify('Wingman W' + w.id + ' inbound', 'info');
+}
+
+function gatherTargets() {
+    const now = Date.now();
+    const out = {};
+    function add(key, p) {
+        const pos = { x: p.x, y: p.y, z: p.z };
+        if (!FPV.isFiniteVec(pos)) { return; }
+        const prev = targetTracks[key];
+        let vel = { x: 0, y: 0, z: 0 };
+        if (prev && now - prev.t > 0 && now - prev.t < 1000) {
+            vel = FPV.scale(FPV.sub(pos, prev.pos), 1000 / (now - prev.t));
+            if (FPV.len(vel) > 150) { vel = { x: 0, y: 0, z: 0 }; }
+        }
+        if (!prev || now - prev.t > 50) { targetTracks[key] = { pos: pos, t: now }; }
+        out[key] = { key: key, pos: pos, vel: vel };
+    }
+    const me = jcmp.localPlayer.networkId;
+    if (jcmp.players) {
+        for (let i = 0; i < jcmp.players.length; i++) {
+            const p = jcmp.players[i];
+            if (!p || p.networkId === me || remotes.pilots[p.networkId] !== undefined) { continue; }
+            if (typeof p.health === 'number' && p.health <= 0) { continue; }
+            // Aim at the chest rather than the feet.
+            const pp = p.position;
+            if (pp) { add('p' + p.networkId, { x: pp.x, y: pp.y + 1.0, z: pp.z }); }
+        }
+    }
+    if (jcmp.vehicles) {
+        for (let i = 0; i < jcmp.vehicles.length; i++) {
+            const v = jcmp.vehicles[i];
+            if (v && v.position) { add('v' + (v.networkId !== undefined ? v.networkId : i), { x: v.position.x, y: v.position.y + 0.8, z: v.position.z }); }
+        }
+    }
+    for (const k in remotes.list) {
+        const r = remotes.list[k];
+        if (r.pose && !(r.flags & FPV.FLAG_CRASHED)) { add('d' + k, r.pose.pos); }
+    }
+    return out;
+}
+
+function swarmAttack() {
+    if (!drone || !swarmEnabled()) { return; }
+    if (swarm.attackers().length) {
+        swarm.recall();
+        notify('Swarm attack called off', 'info');
+        return;
+    }
+    if (!swarm.flying().length) { notify('No wingmen - call one first', 'warn'); return; }
+    const targets = gatherTargets();
+    const list = Object.keys(targets).map(function (k) { return targets[k]; });
+    const n = swarm.attack(list, drone.pos);
+    if (!n) { notify('No targets within ' + swarm.opts.attackRadius + 'm', 'warn'); return; }
+    showBanner('SWARM ATTACK x' + n, 1500);
+    notify(n + ' wingm' + (n === 1 ? 'an' : 'en') + ' attacking', 'warn');
+}
+
+// Hand control to wingman `w`. The old drone rejoins as a wingman if it can
+// still fly, otherwise it is left as a wreck.
+function takeControl(w) {
+    swarm.remove(w);
+    if (drone.crashed || drone.inWater) { swarm.wreck(drone, droneId); }
+    else { swarm.add(drone, 'join', droneId); }
+    drone = w.s;
+    droneId = w.id;
+    drone.events = [];
+    drone.armed = true;
+    drone.crashed = false;
+    armBlockedReason = '';
+    videoGlitchUntil = Date.now() + 350;
+    lastFollow = { x: drone.pos.x - 1e6, y: 0, z: 0 };   // force a follow update
+    showBanner('LINK > W' + w.id, 1200);
+}
+
+function switchDrone() {
+    if (!drone || handover) { return; }
+    const flying = swarm.wingmen.filter(function (w) { return w.role !== 'wreck' && w.role !== 'aim' && !w.s.crashed; })
+        .sort(function (a, b) { return a.id - b.id; });
+    if (!flying.length) { notify('No other drone to switch to', 'warn'); return; }
+    const next = flying.find(function (w) { return w.id > droneId; }) || flying[0];
+    takeControl(next);
+}
+
+// Our drone just crashed: circle the impact point and hand control to the
+// wingman best placed to see it, after it has pointed its camera there.
+function startHandover(point) {
+    if (!swarmEnabled()) { return; }
+    swarm.focus(point);
+    const w = swarm.pickHandover(point);
+    if (!w) { return; }
+    w.role = 'aim';
+    w.aimPoint = { x: point.x, y: point.y, z: point.z };
+    handover = { w: w, t0: Date.now(), point: w.aimPoint };
+    showBanner('LINK > W' + w.id + '  AUTO-AIM', HANDOVER_MAX_MS + 600);
+}
+
+function finishHandover() {
+    const h = handover;
+    handover = null;
+    if (!h || h.w.s.crashed || swarm.wingmen.indexOf(h.w) < 0) { return; }
+    takeControl(h.w);
+}
+
+function sendImpact(id, pos, speed) {
+    if (!cfg.damage.enabled || speed < cfg.damage.minSpeed) { return; }
+    jcmp.events.CallRemote('fpv/impact', id, pos.x, pos.y, pos.z, speed);
 }
 
 // ---- camera ----------------------------------------------------------------
 
-function lookRotation(dir) {
-    const n = FPV.norm(dir);
-    const yaw = Math.atan2(-n.x, -n.z);
-    const pitch = Math.asin(FPV.clamp(n.y, -1, 1));
-    return FPV.qMul(FPV.qAxisAngle({ x: 0, y: 1, z: 0 }, yaw), FPV.qAxisAngle({ x: 1, y: 0, z: 0 }, pitch));
-}
-
 function cameraFor(view, dt) {
+    const s = handover ? handover.w.s : drone;
     if (view === 'chase') {
-        const target = FPV.yawOf(drone.q);
+        const target = FPV.yawOf(s.q);
         chaseYaw += FPV.wrapAngle(target - chaseYaw) * (1 - Math.exp(-dt * 4));
         const h = FPV.qAxisAngle({ x: 0, y: 1, z: 0 }, chaseYaw);
         const back = FPV.qRotate(h, { x: 0, y: 0, z: 3.0 });
-        const pos = FPV.add(drone.pos, { x: back.x, y: 1.0, z: back.z });
-        return { pos: pos, q: lookRotation(FPV.sub(drone.pos, pos)) };
+        const pos = FPV.add(s.pos, { x: back.x, y: 1.0, z: back.z });
+        return { pos: pos, q: FPV.lookRotation(FPV.sub(s.pos, pos)) };
     }
     if (view === 'los') {
         const eye = FPV.add(launch, { x: 0, y: 1.7, z: 0 });
-        const d = FPV.sub(drone.pos, eye);
-        return { pos: eye, q: FPV.len(d) > 0.5 ? lookRotation(d) : FPV.qAxisAngle({ x: 0, y: 1, z: 0 }, FPV.yawOf(drone.q)) };
+        const d = FPV.sub(s.pos, eye);
+        return { pos: eye, q: FPV.len(d) > 0.5 ? FPV.lookRotation(d) : FPV.qAxisAngle({ x: 0, y: 1, z: 0 }, FPV.yawOf(s.q)) };
     }
-    return FPV.cameraPose(drone, tune);
+    return FPV.cameraPose(s, tune);
 }
 
 function applyCamera(cam) {
@@ -936,9 +1561,11 @@ function applyCamera(cam) {
 
 // ---- per-frame -------------------------------------------------------------
 
-function crashFeedback(ev) {
+function onOwnCrash(ev) {
     videoGlitchUntil = Date.now() + 600;
     jcmp.events.CallRemote('fpv/crash', ev.reason);
+    if (ev.reason !== 'WATER' && ev.reason !== 'HIT') { sendImpact(droneId, drone.pos, ev.speed); }
+    startHandover(drone.pos);
 }
 
 function probeTerrain(dt) {
@@ -948,7 +1575,7 @@ function probeTerrain(dt) {
     if (!hit) { return; }
     const camFwd = FPV.qRotate(prevCam.q, { x: 0, y: 0, z: -1 });
     const dist = world.probe(prevCam.pos, camFwd, fromVec3f(hit));
-    if (dist < 0 || settings.view !== 'fpv' || drone.crashed) { return; }
+    if (dist < 0 || settings.view !== 'fpv' || drone.crashed || handover) { return; }
 
     // Head-on obstacle check along the camera ray.
     const along = FPV.dot(drone.vel, camFwd);
@@ -957,7 +1584,11 @@ function probeTerrain(dt) {
         const h = fromVec3f(hit);
         drone.pos = FPV.sub(h, FPV.scale(camFwd, tune.collisionRadius + 0.05));
         if (along > tune.crashSpeed) {
+            // Report the crash at the surface we hit (the attack point).
             FPV.crash(drone, 'IMPACT');
+            const ev = drone.events[drone.events.length - 1];
+            ev.speed = along;
+            drone.pos = h;
             drone.vel = FPV.scale(drone.vel, -0.1);
             // Looking down at what we hit -> it is ground, rest on it. A wall
             // hit lets the wreck drop to whatever floor is known below.
@@ -965,22 +1596,31 @@ function probeTerrain(dt) {
         } else {
             // Gentle bump: bounce off, stay armed.
             drone.vel = FPV.sub(drone.vel, FPV.scale(camFwd, along * 1.4));
-            drone.events.push({ type: 'bump' });
         }
     }
+}
+
+function packDrone(id, s, flags) {
+    const r2 = function (v) { return Math.round(v * 100) / 100; };
+    const r4 = function (v) { return Math.round(v * 10000) / 10000; };
+    return [id, r2(s.pos.x), r2(s.pos.y), r2(s.pos.z), r4(s.q.x), r4(s.q.y), r4(s.q.z), r4(s.q.w), flags];
 }
 
 function sendState(now) {
     if (now - lastSend < 1000 / cfg.syncRateHz) { return; }
     lastSend = now;
-    const p = drone.pos, q = drone.q;
-    jcmp.events.CallRemote('fpv/state', p.x, p.y, p.z, q.x, q.y, q.z, q.w, drone.armed ? 1 : 0, drone.motor);
+    const list = [packDrone(droneId, drone, FPV.FLAG_CONTROLLED |
+        (drone.armed ? FPV.FLAG_ARMED : 0) | (drone.crashed ? FPV.FLAG_CRASHED : 0))];
+    swarm.wingmen.forEach(function (w) {
+        list.push(packDrone(w.id, w.s, (w.s.armed ? FPV.FLAG_ARMED : 0) | (w.s.crashed ? FPV.FLAG_CRASHED : 0)));
+    });
+    jcmp.events.CallRemote('fpv/swarm', JSON.stringify(list));
 }
 
 function followCheck(now) {
     // The world streams around the (frozen) character, so drag it along
     // underneath the drone when we get far away.
-    if (now - lastFollowCheck < 1000) { return; }
+    if (now - lastFollowCheck < 1000 || !cfg.followDistance) { return; }
     lastFollowCheck = now;
     const dx = drone.pos.x - lastFollow.x, dz = drone.pos.z - lastFollow.z;
     if (dx * dx + dz * dz > cfg.followDistance * cfg.followDistance) {
@@ -992,30 +1632,31 @@ function followCheck(now) {
 function sendOsd(now) {
     if (now - lastOsd < OSD_INTERVAL_MS) { return; }
     lastOsd = now;
-    const fwd = FPV.qRotate(drone.q, { x: 0, y: 0, z: -1 });
-    const right = FPV.qRotate(drone.q, { x: 1, y: 0, z: 0 });
-    const toHome = FPV.sub(launch, drone.pos);
+    const s = handover ? handover.w.s : drone;
+    const fwd = FPV.qRotate(s.q, { x: 0, y: 0, z: -1 });
+    const right = FPV.qRotate(s.q, { x: 1, y: 0, z: 0 });
+    const toHome = FPV.sub(launch, s.pos);
     const distHome = Math.sqrt(toHome.x * toHome.x + toHome.z * toHome.z);
     const homeYaw = Math.atan2(-toHome.x, -toHome.z);
     const vr = cfg.videoRange;
-    let noise = FPV.clamp((FPV.dist(launch, drone.pos) - vr * 0.75) / (vr * 0.25), 0, 1);
+    let noise = FPV.clamp((FPV.dist(launch, s.pos) - vr * 0.75) / (vr * 0.25), 0, 1);
     if (now < videoGlitchUntil) { noise = Math.max(noise, (videoGlitchUntil - now) / 600); }
     jcmp.ui.CallEvent('fpv/osd', JSON.stringify({
-        armed: drone.armed,
-        crashed: drone.crashed,
-        reason: drone.crashReason,
+        armed: s.armed,
+        crashed: s.crashed,
+        reason: s.crashReason,
         blocked: armBlockedReason,
         mode: settings.mode,
         altHold: settings.altHold,
         view: settings.view,
         thr: input.throttle,
-        motor: drone.motor,
-        speed: FPV.len(drone.vel) * 3.6,
-        vspeed: drone.vel.y,
-        alt: drone.pos.y - launch.y,
-        asl: drone.pos.y - cfg.seaLevel,
+        motor: s.motor,
+        speed: FPV.len(s.vel) * 3.6,
+        vspeed: s.vel.y,
+        alt: s.pos.y - launch.y,
+        asl: s.pos.y - cfg.seaLevel,
         home: distHome,
-        homeDir: FPV.wrapAngle(homeYaw - FPV.yawOf(drone.q)),
+        homeDir: FPV.wrapAngle(homeYaw - FPV.yawOf(s.q)),
         pitch: Math.asin(FPV.clamp(fwd.y, -1, 1)),
         roll: Math.asin(FPV.clamp(-right.y, -1, 1)),
         tilt: tune.cameraTiltDeg,
@@ -1023,13 +1664,33 @@ function sendOsd(now) {
         cells: tune.battery.cells,
         mah: drone.usedMah,
         cap: tune.battery.capacityMah,
-        batt: tune.battery.enabled,
+        batt: tune.battery.enabled && !handover,
         amps: drone.currentA,
         time: drone.flightTime,
         noise: noise,
         probe: world.probeValid,
-        src: input.source
+        src: input.source,
+        swarm: swarmEnabled() ? {
+            n: swarm.flying().length,
+            max: swarm.opts.maxWingmen,
+            mode: swarm.mode,
+            atk: swarm.attackers().length,
+            id: droneId
+        } : null,
+        handover: !!handover,
+        banner: banner && now < banner.until ? banner.text : ''
     }));
+}
+
+function ownPoses() {
+    const poses = [];
+    const viewing = handover ? handover.w.s : drone;
+    if (drone && (settings.view !== 'fpv' || viewing !== drone)) { poses.push({ pos: drone.pos, q: drone.q }); }
+    swarm.wingmen.forEach(function (w) {
+        if (settings.view === 'fpv' && w.s === viewing) { return; }
+        poses.push({ pos: w.s.pos, q: w.s.q });
+    });
+    return poses;
 }
 
 function frame(r) {
@@ -1042,7 +1703,10 @@ function frame(r) {
 
     remotes.update(now);
     const camPos = fromVec3f(jcmp.localPlayer.camera.position);
-    renderer.draw3d(r, remotes, camPos, settings.camera.modelRotSign);
+    const poses = [];
+    for (const k in remotes.list) { if (remotes.list[k].pose) { poses.push(remotes.list[k].pose); } }
+    if (status === 'flying' && drone) { Array.prototype.push.apply(poses, ownPoses()); }
+    renderer.draw3d(r, poses, camPos, settings.camera.modelRotSign);
 
     if (status !== 'flying' || !drone) { return; }
 
@@ -1065,7 +1729,25 @@ function frame(r) {
 
     while (drone.events.length) {
         const ev = drone.events.shift();
-        if (ev.type === 'crash') { crashFeedback(ev); }
+        if (ev.type === 'crash') { onOwnCrash(ev); }
+    }
+
+    // Wingmen.
+    if (swarm.wingmen.length) {
+        const targets = swarm.attackers().length ? gatherTargets() : {};
+        swarm.update(dt, drone, world, targets);
+        while (swarm.events.length) {
+            const ev = swarm.events.shift();
+            if (ev.type === 'impact') { sendImpact(ev.id, ev.pos, ev.speed); }
+            else if (ev.type === 'lost') { notify('Wingman W' + ev.id + (ev.reason === 'WATER' ? ' ditched' : ' lost'), 'warn'); }
+        }
+    }
+    if (handover) {
+        if (handover.w.s.crashed || swarm.wingmen.indexOf(handover.w) < 0) {
+            handover = null;
+        } else if (swarm.aimError(handover.w) < 6 * FPV.DEG || now - handover.t0 > HANDOVER_MAX_MS) {
+            finishHandover();
+        }
     }
 
     const cam = cameraFor(settings.view, dt);
@@ -1082,6 +1764,25 @@ function frame(r) {
     sendOsd(now);
 }
 
+function labels() {
+    const out = [];
+    for (const k in remotes.list) {
+        const r = remotes.list[k];
+        if (!r.pose || !(r.flags & FPV.FLAG_CONTROLLED)) { continue; }
+        out.push({ pos: r.pose.pos, text: remotes.pilots[r.pilot] || ('Pilot ' + r.pilot),
+            color: (r.flags & FPV.FLAG_ARMED) ? COLOR_ARMED : COLOR_NAME });
+    }
+    if (status === 'flying' && drone) {
+        swarm.wingmen.forEach(function (w) {
+            if (handover && w === handover.w) { return; }
+            const tag = w.role === 'attack' ? 'W' + w.id + ' ATK' : (w.role === 'wreck' ? 'W' + w.id + ' X' : 'W' + w.id);
+            out.push({ pos: w.s.pos, text: tag, size: 14,
+                color: w.role === 'attack' ? COLOR_ATTACK : (w.role === 'wreck' ? COLOR_WRECK : COLOR_WING) });
+        });
+    }
+    return out;
+}
+
 // ---- events: game ----------------------------------------------------------
 
 jcmp.events.Add('GameUpdateRender', (r) => {
@@ -1090,7 +1791,9 @@ jcmp.events.Add('GameUpdateRender', (r) => {
 
 jcmp.events.Add('Render', (r) => {
     try {
-        renderer.draw2d(r, remotes, fromVec3f(jcmp.localPlayer.camera.position));
+        const now = Date.now();
+        while (effects.length && now - effects[0].t0 > 1000) { effects.shift(); }
+        renderer.draw2d(r, labels(), effects, fromVec3f(jcmp.localPlayer.camera.position), now);
     } catch (e) { log('render error: ' + e); }
 });
 
@@ -1121,7 +1824,7 @@ jcmp.ui.AddEvent('fpv/ui/sticks', (t, roll, pitch, yaw, arm, mode, source) => {
         const on = arm > 0.5;
         if (armSwitchPrev !== null && on !== armSwitchPrev) { armRequest(on); }
         armSwitchPrev = on;
-        if (!on && drone.armed) { FPV.disarm(drone); }
+        if (!on && drone.armed && !handover) { FPV.disarm(drone); }
     }
     if (mode > -1.5) {
         const m = mode < -0.33 ? 'acro' : (mode > 0.33 ? 'angle' : 'horizon');
@@ -1164,7 +1867,7 @@ jcmp.events.AddRemoteCallable('fpv/config', (json) => {
     try {
         const c = JSON.parse(json);
         for (const k in cfg) {
-            if (Object.prototype.hasOwnProperty.call(c, k) && typeof c[k] === typeof cfg[k]) { cfg[k] = c[k]; }
+            if (Object.prototype.hasOwnProperty.call(c, k) && typeof c[k] === typeof cfg[k] && c[k] !== null) { cfg[k] = c[k]; }
         }
         world.seaLevel = cfg.seaLevel;
         rebuildTune();
@@ -1192,18 +1895,37 @@ jcmp.events.AddRemoteCallable('fpv/force_stop', (reason) => {
 
 jcmp.events.AddRemoteCallable('fpv/remote_start', (id, name) => {
     if (id === jcmp.localPlayer.networkId) { return; }
-    remotes.ensure(id, name).last = Date.now();
+    remotes.addPilot(id, name);
 });
 
-jcmp.events.AddRemoteCallable('fpv/remote_stop', (id) => { remotes.remove(id); });
+jcmp.events.AddRemoteCallable('fpv/remote_stop', (id) => { remotes.removePilot(id); });
 
-jcmp.events.AddRemoteCallable('fpv/remote_state', (id, x, y, z, qx, qy, qz, qw, armed, motor) => {
+jcmp.events.AddRemoteCallable('fpv/remote_swarm', (id, json) => {
     if (id === jcmp.localPlayer.networkId) { return; }
-    remotes.push(id, Date.now(), { x: x, y: y, z: z }, { x: qx, y: qy, z: qz, w: qw }, !!armed, motor);
+    let list;
+    try { list = JSON.parse(json); } catch (e) { return; }
+    if (Array.isArray(list)) { remotes.pushSwarm(id, Date.now(), list); }
 });
 
 jcmp.events.AddRemoteCallable('fpv/remote_crash', (name, reason) => {
     jcmp.ui.CallEvent('fpv/feed', name + (reason === 'WATER' ? ' ditched in the sea' : ' crashed'));
+});
+
+jcmp.events.AddRemoteCallable('fpv/remote_impact', (x, y, z) => {
+    effects.push({ pos: { x: x, y: y, z: z }, t0: Date.now() });
+    if (effects.length > 32) { effects.shift(); }
+});
+
+// Someone else's drone blew up next to one of ours.
+jcmp.events.AddRemoteCallable('fpv/hit', (id, byName) => {
+    if (!drone) { return; }
+    if (id === droneId) {
+        FPV.crash(drone, 'HIT');
+        notify('Shot down by ' + byName, 'warn');
+        return;
+    }
+    const w = swarm.wingmen.find(function (x) { return x.id === id; });
+    if (w) { FPV.crash(w.s, 'HIT'); }
 });
 
 })();
