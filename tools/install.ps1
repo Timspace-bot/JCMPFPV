@@ -8,8 +8,12 @@
 param(
     [string]$ServerDir = "",
     [string]$SteamCommon = "",
+    [string]$InstallServerTo = "",   # where to put the server if it has to be downloaded
+    [switch]$Yes,                    # don't ask before downloading the server
     [switch]$NoStart
 )
+
+$SERVER_APPID = 619960   # Just Cause 3: Multiplayer Mod - Dedicated Server (anonymous SteamCMD login)
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
@@ -63,6 +67,29 @@ function Get-SteamCommonDirs {
     }
 }
 
+# Download SteamCMD and use it to install/update the dedicated server.
+function Install-Server([string]$dir) {
+    $steamcmdDir = Join-Path $dir "steamcmd"
+    $steamcmd = Join-Path $steamcmdDir "steamcmd.exe"
+    New-Item -ItemType Directory -Force -Path $steamcmdDir | Out-Null
+    if (-not (Test-Path $steamcmd)) {
+        Write-Host "Downloading SteamCMD..."
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $zip = Join-Path $steamcmdDir "steamcmd.zip"
+        Invoke-WebRequest -UseBasicParsing -Uri "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip" -OutFile $zip
+        Expand-Archive -Force -Path $zip -DestinationPath $steamcmdDir
+        Remove-Item $zip
+    }
+    # SteamCMD updates itself on first run and sometimes exits before
+    # installing anything, so try twice and check for the server exe.
+    for ($i = 1; $i -le 2; $i++) {
+        Write-Host "Installing the JC3MP server with SteamCMD (attempt $i)... this can take a few minutes."
+        & $steamcmd +force_install_dir "$dir" +login anonymous +app_update $SERVER_APPID validate +quit | Out-Host
+        if (Find-ServerExe $dir) { return $dir }
+    }
+    Write-Error "SteamCMD finished but no server executable appeared in $dir. Check the SteamCMD output above."
+}
+
 if ($ServerDir -eq "") {
     Write-Host "Searching your Steam libraries for the JC3MP dedicated server..."
     $candidates = @()
@@ -78,18 +105,30 @@ if ($ServerDir -eq "") {
         $exe = Find-ServerExes $c.FullName 3 | Select-Object -First 1
         if ($exe) { $ServerDir = $exe.DirectoryName; break }
     }
+    # A server this script installed earlier.
+    if ($ServerDir -eq "") {
+        foreach ($drive in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+            $d = Join-Path $drive.Root "JC3MP-Server"
+            if ((Test-Path $d) -and (Find-ServerExe $d)) { $ServerDir = $d; break }
+        }
+    }
     if ($ServerDir -eq "") {
         Write-Host ""
-        Write-Host "Couldn't find a JC3MP server executable. Folders checked:"
-        foreach ($c in $candidates) {
-            Write-Host "  $($c.FullName)"
-            Get-ChildItem -Path $c.FullName -Filter "*.exe" -File -Recurse -Depth 2 -ErrorAction SilentlyContinue |
-                Select-Object -First 15 | ForEach-Object { Write-Host "      $($_.FullName)" }
+        Write-Host "No JC3MP dedicated server is installed (only the game / client were found)."
+        if ($InstallServerTo -eq "") {
+            # Put it next to the JC3MP client if we saw it, else on the first library's drive.
+            $mp = $candidates | Where-Object { $_.Name -match "Multiplayer|JC3MP" } | Select-Object -First 1
+            $base = if ($mp) { Split-Path -Qualifier $mp.FullName } else { "C:" }
+            $InstallServerTo = Join-Path ($base + "\") "JC3MP-Server"
         }
-        Write-Host ""
-        Write-Host "Install 'Just Cause 3: Multiplayer Mod - Dedicated Server' from Steam (Library > Tools),"
-        Write-Host "then re-run, or pass its folder with -ServerDir."
-        exit 1
+        if (-not $Yes) {
+            $answer = Read-Host "Download the free JC3MP dedicated server (~1 GB, Steam app $SERVER_APPID) to $InstallServerTo now? [Y/n]"
+            if ($answer -match "^[nN]") {
+                Write-Host "OK - install it yourself, then re-run with -ServerDir <folder>."
+                exit 1
+            }
+        }
+        $ServerDir = Install-Server $InstallServerTo
     }
 }
 
