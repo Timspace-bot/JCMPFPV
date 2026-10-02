@@ -68,10 +68,15 @@ function Get-SteamCommonDirs {
 }
 
 # Download SteamCMD and use it to install/update the dedicated server.
-function Install-Server([string]$dir) {
-    $steamcmdDir = Join-Path $dir "steamcmd"
+# Layout: <root>\steamcmd (SteamCMD) and <root>\server (the JC3MP server).
+# The server must not go in a folder that contains SteamCMD, or SteamCMD
+# ignores the path and installs under steamcmd\steamapps\common instead.
+function Install-Server([string]$root) {
+    $steamcmdDir = Join-Path $root "steamcmd"
+    $serverDir = Join-Path $root "server"
     $steamcmd = Join-Path $steamcmdDir "steamcmd.exe"
     New-Item -ItemType Directory -Force -Path $steamcmdDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $serverDir | Out-Null
     if (-not (Test-Path $steamcmd)) {
         Write-Host "Downloading SteamCMD..."
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -84,10 +89,15 @@ function Install-Server([string]$dir) {
     # installing anything, so try twice and check for the server exe.
     for ($i = 1; $i -le 2; $i++) {
         Write-Host "Installing the JC3MP server with SteamCMD (attempt $i)... this can take a few minutes."
-        & $steamcmd +force_install_dir "$dir" +login anonymous +app_update $SERVER_APPID validate +quit | Out-Host
-        if (Find-ServerExe $dir) { return $dir }
+        & $steamcmd +force_install_dir "$serverDir" +login anonymous +app_update $SERVER_APPID validate +quit | Out-Host
+        $exe = Find-ServerExes $root 6 | Select-Object -First 1
+        if ($exe) { return $exe.DirectoryName }
     }
-    Write-Error "SteamCMD finished but no server executable appeared in $dir. Check the SteamCMD output above."
+    Write-Host ""
+    Write-Host "Executables found under ${root}:"
+    Get-ChildItem -Path $root -Filter "*.exe" -File -Recurse -Depth 6 -ErrorAction SilentlyContinue |
+        Select-Object -First 30 | ForEach-Object { Write-Host "  $($_.FullName)" }
+    Write-Error "SteamCMD finished but no server executable was found under $root. Paste the list above."
 }
 
 if ($ServerDir -eq "") {
@@ -109,7 +119,11 @@ if ($ServerDir -eq "") {
     if ($ServerDir -eq "") {
         foreach ($drive in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
             $d = Join-Path $drive.Root "JC3MP-Server"
-            if ((Test-Path $d) -and (Find-ServerExe $d)) { $ServerDir = $d; break }
+            if (-not (Test-Path $d)) { continue }
+            # Search deep: older versions of this script left the server
+            # under JC3MP-Server\steamcmd\steamapps\common\...
+            $exe = Find-ServerExes $d 6 | Select-Object -First 1
+            if ($exe) { $ServerDir = $exe.DirectoryName; Write-Host "Found server installed earlier: $ServerDir"; break }
         }
     }
     if ($ServerDir -eq "") {
