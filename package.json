@@ -1,0 +1,12 @@
+{
+    "name": "jcmpfpv",
+    "version": "1.0.0",
+    "private": true,
+    "description": "FPV drone mod for Just Cause 3 Multiplayer (JC3MP)",
+    "scripts": {
+        "build": "node tools/build.js",
+        "textures": "node tools/gen_textures.js",
+        "test": "node tools/build.js && node --test test/*.test.js"
+    },
+    "license": "MIT"
+}

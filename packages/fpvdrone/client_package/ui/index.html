@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>FPV Drone</title>
+    <link rel="stylesheet" type="text/css" href="style.css">
+</head>
+<body>
+    <canvas id="osd"></canvas>
+
+    <div id="toasts"></div>
+    <div id="feed"></div>
+
+    <div id="menu" class="hidden">
+        <div class="menu-head">
+            <span class="title">FPV DRONE</span>
+            <span class="tabs">
+                <button data-tab="controls" class="active">Controls</button>
+                <button data-tab="rates">Rates</button>
+                <button data-tab="quad">Quad</button>
+                <button data-tab="camera">Camera</button>
+                <button data-tab="help">Keys</button>
+            </span>
+            <button id="menu-close" class="ghost">&times;</button>
+        </div>
+
+        <div class="tab" id="tab-controls">
+            <div class="row">
+                <label>Input device</label>
+                <select id="in-device">
+                    <option value="auto">Auto (controller if connected)</option>
+                    <option value="gamepad">Controller / RC transmitter</option>
+                    <option value="keyboard">Keyboard</option>
+                </select>
+                <span id="pad-name" class="muted">No controller detected - press any button on it</span>
+            </div>
+            <div class="row">
+                <label>Preset</label>
+                <button id="preset-rc">RC transmitter (AETR, EdgeTX/OpenTX USB)</button>
+                <button id="preset-xbox">Xbox / PlayStation pad (Mode 2)</button>
+            </div>
+            <table id="channels">
+                <thead><tr><th>Channel</th><th>Source</th><th>Invert</th><th></th><th>Value</th></tr></thead>
+                <tbody></tbody>
+            </table>
+            <div class="row">
+                <button id="cal-btn">Calibrate sticks</button>
+                <span id="cal-msg" class="muted"></span>
+            </div>
+            <div class="row">
+                <label>Deadband</label>
+                <input type="number" id="in-deadband" step="0.005" min="0" max="0.2">
+                <label>Keyboard stick strength</label>
+                <input type="number" id="in-kb" step="0.05" min="0.1" max="1">
+            </div>
+            <div class="row"><label>Raw axes</label><div id="raw-axes" class="raw"></div></div>
+        </div>
+
+        <div class="tab hidden" id="tab-rates">
+            <p class="muted">Betaflight-style rates. Max rate (deg/s) is shown live.</p>
+            <table class="grid">
+                <thead><tr><th></th><th>RC rate</th><th>Super rate</th><th>Expo</th><th>Max deg/s</th></tr></thead>
+                <tbody>
+                    <tr data-axis="roll"><td>Roll</td><td><input type="number" step="0.01" data-k="rcRate"></td><td><input type="number" step="0.01" data-k="superRate"></td><td><input type="number" step="0.01" data-k="expo"></td><td class="maxrate"></td></tr>
+                    <tr data-axis="pitch"><td>Pitch</td><td><input type="number" step="0.01" data-k="rcRate"></td><td><input type="number" step="0.01" data-k="superRate"></td><td><input type="number" step="0.01" data-k="expo"></td><td class="maxrate"></td></tr>
+                    <tr data-axis="yaw"><td>Yaw</td><td><input type="number" step="0.01" data-k="rcRate"></td><td><input type="number" step="0.01" data-k="superRate"></td><td><input type="number" step="0.01" data-k="expo"></td><td class="maxrate"></td></tr>
+                </tbody>
+            </table>
+            <div class="row">
+                <label>Throttle mid</label><input type="number" step="0.01" min="0" max="1" data-tune="throttleMid">
+                <label>Throttle expo</label><input type="number" step="0.01" min="0" max="1" data-tune="throttleExpo">
+            </div>
+            <div class="row">
+                <label>Default mode</label>
+                <select id="in-mode"><option value="acro">Acro (rate)</option><option value="horizon">Horizon</option><option value="angle">Angle (self-level)</option></select>
+                <label><input type="checkbox" id="in-althold"> Altitude assist (angle/horizon: centre throttle = hover)</label>
+            </div>
+        </div>
+
+        <div class="tab hidden" id="tab-quad">
+            <div class="row"><label>Thrust / weight</label><input type="number" step="0.1" min="1.5" max="20" data-tune="thrustToWeight"><span class="muted">5" freestyle ~ 7, cinewhoop ~ 3.5, racer ~ 10</span></div>
+            <div class="row"><label>Mass (kg)</label><input type="number" step="0.01" min="0.05" max="5" data-tune="massKg"></div>
+            <div class="row"><label>Camera uptilt (deg)</label><input type="number" step="1" min="-10" max="70" data-tune="cameraTiltDeg"></div>
+            <div class="row"><label>Angle mode max tilt (deg)</label><input type="number" step="1" min="10" max="85" data-tune="angleMaxDeg"></div>
+            <div class="row"><label>Crash speed (m/s)</label><input type="number" step="0.5" min="1" max="100" data-tune="crashSpeed"></div>
+            <div class="row">
+                <label><input type="checkbox" data-tune="battery.enabled"> Battery simulation</label>
+                <label>Cells</label><input type="number" step="1" min="1" max="8" data-tune="battery.cells">
+                <label>Capacity (mAh)</label><input type="number" step="50" min="100" max="10000" data-tune="battery.capacityMah">
+            </div>
+            <div class="row">
+                <label><input type="checkbox" id="osd-ahi"> Artificial horizon</label>
+                <label><input type="checkbox" id="osd-noise"> Analog video noise</label>
+                <label>Craft name</label><input type="text" id="osd-name" maxlength="16">
+            </div>
+        </div>
+
+        <div class="tab hidden" id="tab-camera">
+            <div class="row"><label>Field of view (deg, vertical)</label><input type="number" step="1" min="40" max="150" id="cam-fov"></div>
+            <p class="muted">Calibration: if the picture rolls/pitches/yaws the wrong way compared to the drone, flip the matching axis here. These map the simulation onto JC3's camera angles and only need setting once.</p>
+            <div class="row">
+                <label><input type="checkbox" id="cam-pitch"> Invert pitch</label>
+                <label><input type="checkbox" id="cam-yaw"> Invert yaw</label>
+                <label><input type="checkbox" id="cam-roll"> Invert roll</label>
+                <label><input type="checkbox" id="cam-model"> Invert other drones' model rotation</label>
+            </div>
+            <div class="row">
+                <label>Euler order</label>
+                <select id="cam-order"><option>YXZ</option><option>ZXY</option><option>XYZ</option><option>ZYX</option><option>YZX</option><option>XZY</option></select>
+            </div>
+            <div class="row"><button id="cam-reset">Reset camera calibration</button></div>
+        </div>
+
+        <div class="tab hidden" id="tab-help">
+            <table class="keys" id="keys"><tbody></tbody></table>
+            <p class="muted">Click a key to rebind it. Keyboard flight: W/S throttle, A/D yaw, arrow keys pitch &amp; roll. Angle mode + altitude assist is the easiest way to fly on a keyboard.</p>
+        </div>
+
+        <div class="menu-foot">
+            <button id="reset-all" class="ghost">Restore defaults</button>
+            <span class="muted">Settings save automatically</span>
+        </div>
+    </div>
+
+    <script src="ui.js"></script>
+</body>
+</html>
