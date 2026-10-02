@@ -21,14 +21,17 @@ FPV.World = function (seaLevel) {
     this.cellCount = 0;
     this.cellSize = 2.0;
     this.maxCells = 30000;
+    this.searchCells = 2;     // floor lookups also consider samples up to 2 cells (~5 m) away
     this.probeValid = false;  // did the last lookAt sample line up with our camera?
     this.validSamples = 0;
+    this.probeTries = 0;
+    this.lastSrc = 'sea';
 };
 
+// Forget pads (per flight). Terrain samples are kept for the whole session:
+// the ground does not move, so everything learned stays useful.
 FPV.World.prototype.reset = function () {
     this.pads = [];
-    this.cells = {};
-    this.cellCount = 0;
 };
 
 FPV.World.prototype.addPad = function (x, y, z, radius) {
@@ -55,34 +58,53 @@ FPV.World.prototype.addSample = function (p) {
     if (list.length > 4) { list.shift(); }
 };
 
-// Highest known surface at or just below `pos` (tolerance lets the quad sit
-// on a surface whose sample was a few cm above its contact point).
+// Highest known surface at or just below `pos`. Surfaces sampled within a
+// few metres count too (terrain is continuous, and a single 2 m cell is easy
+// to miss), and the tolerance lets the quad sit on a surface whose sample was
+// a few cm above its contact point.
 FPV.World.prototype.floorAt = function (pos) {
     let y = this.seaLevel;
     let water = true;
+    let src = 'sea';
     const tol = 0.5;
 
     for (let i = 0; i < this.pads.length; i++) {
         const p = this.pads[i];
         const dx = pos.x - p.x, dz = pos.z - p.z;
         if (dx * dx + dz * dz <= p.r * p.r && p.y <= pos.y + tol && p.y > y) {
-            y = p.y; water = false;
+            y = p.y; water = false; src = 'pad';
         }
     }
 
-    const list = this.cells[this.cellKey(pos.x, pos.z)];
-    if (list) {
-        for (let i = 0; i < list.length; i++) {
-            if (list[i] <= pos.y + tol && list[i] > y) { y = list[i]; water = false; }
+    const cs = this.cellSize;
+    const cx = Math.floor(pos.x / cs), cz = Math.floor(pos.z / cs);
+    const R = this.searchCells;
+    for (let ix = -R; ix <= R; ix++) {
+        for (let iz = -R; iz <= R; iz++) {
+            const list = this.cells[(cx + ix) + ':' + (cz + iz)];
+            if (!list) { continue; }
+            for (let i = 0; i < list.length; i++) {
+                if (list[i] <= pos.y + tol && list[i] > y) { y = list[i]; water = false; src = 'map'; }
+            }
         }
     }
+    this.lastSrc = src;
     return { y: y, water: water };
 };
+
+// Ground truth from something standing on the ground (Rico's feet, other
+// players on foot): stored as a sample plus a small pad.
+FPV.World.prototype.addGround = function (x, y, z) {
+    this.addSample({ x: x, y: y, z: z });
+};
+
+FPV.World.prototype.sampleCount = function () { return this.cellCount; };
 
 // Validate a lookAt point against the camera ray. Returns the hit distance
 // along the ray, or -1 if the sample does not belong to our camera.
 FPV.World.prototype.probe = function (camPos, camFwd, hit) {
     this.probeValid = false;
+    this.probeTries++;
     if (!hit || !FPV.isFiniteVec(hit)) { return -1; }
     const d = FPV.sub(hit, camPos);
     const dist = FPV.len(d);

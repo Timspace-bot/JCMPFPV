@@ -138,3 +138,27 @@ test('max wingmen is enforced', () => {
     assert.ok(swarm.spawn({ x: 0, y: 0, z: 0 }));
     assert.strictEqual(swarm.spawn({ x: 0, y: 0, z: 0 }), null);
 });
+
+test('model: faces are finite and every texture exists', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const dir = path.join(__dirname, '..', 'packages', 'fpvdrone', 'client_package', 'textures');
+    const faces = FPV.buildFaces(FPV.QUAD_PARTS, { camTilt: 0.4 }).concat(FPV.buildFaces(FPV.TX_PARTS));
+    assert.ok(faces.length > 100);
+    faces.forEach((f) => {
+        assert.ok(f.w > 0 && f.h > 0 && isFinite(f.w) && isFinite(f.h));
+        f.ops.forEach((o) => o.slice(1).forEach((v) => assert.ok(isFinite(v))));
+    });
+    FPV.TEXTURES.forEach((t) => assert.ok(fs.existsSync(path.join(dir, t + '.png')), t));
+});
+
+test('world: nearby samples and footprints hold the quad up; sea elsewhere', () => {
+    const w = new FPV.World(1024);
+    w.addGround(100, 1040, 100);
+    assert.strictEqual(w.floorAt({ x: 103, y: 1041, z: 101 }).y, 1040, 'within a few metres');
+    assert.strictEqual(w.floorAt({ x: 103, y: 1041, z: 101 }).water, false);
+    assert.strictEqual(w.floorAt({ x: 130, y: 1041, z: 100 }).y, 1024, 'far away -> sea');
+    assert.strictEqual(w.floorAt({ x: 100, y: 1030, z: 100 }).y, 1024, 'surface above us is not a floor');
+    w.reset();
+    assert.strictEqual(w.floorAt({ x: 100, y: 1041, z: 100 }).y, 1040, 'terrain survives a new flight');
+});

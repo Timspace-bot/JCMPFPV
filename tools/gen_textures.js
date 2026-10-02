@@ -82,45 +82,137 @@ function segDist(px, py, ax, ay, bx, by) {
     return Math.sqrt(x * x + y * y);
 }
 
-const CARBON = [30, 32, 36, 255];
-const FRONT = [255, 120, 30, 255];      // orange props mark the nose
-const REAR = [230, 230, 235, 255];
-const BODY = [60, 64, 72, 255];
-const LED = [80, 255, 140, 255];
+function hash(x, y) {
+    const h = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
+    return h - Math.floor(h);
+}
 
-// Top view, nose towards v = 0 (top of the image).
-function droneTop(u, v) {
-    const motors = [[0.2, 0.2, true], [0.8, 0.2, true], [0.2, 0.8, false], [0.8, 0.8, false]];
-    for (const m of motors) {
-        const d = Math.hypot(u - m[0], v - m[1]);
-        if (d < 0.05) { return BODY; }
-        if (d < 0.17 && d > 0.155) { return m[2] ? FRONT : REAR; }      // prop guard ring
-        if (d < 0.155) {
-            // translucent prop disc with two blades
-            const ang = Math.atan2(v - m[1], u - m[0]);
-            const blade = Math.abs(Math.sin(ang)) < 0.18;
-            const c = m[2] ? FRONT : REAR;
-            return blade ? c : [c[0], c[1], c[2], 70];
-        }
+function shade(c, k) { return [Math.min(255, c[0] * k), Math.min(255, c[1] * k), Math.min(255, c[2] * k), c[3] === undefined ? 255 : c[3]]; }
+
+// 2x2 twill carbon weave with a soft sheen; k = brightness for the face.
+function carbon(k) {
+    return function (u, v) {
+        const n = 16;
+        const cx = Math.floor(u * n), cy = Math.floor(v * n);
+        const fx = u * n - cx, fy = v * n - cy;
+        const weave = ((cx + cy) >> 1) % 2 === 0;
+        const along = weave ? fx : fy;
+        const sheen = 0.75 + 0.35 * Math.sin(along * Math.PI);
+        const grain = 0.92 + 0.08 * hash(cx, cy);
+        const edge = Math.min(u, v, 1 - u, 1 - v) < 0.04 ? 1.5 : 1;   // chamfered edge highlight
+        const b = 30 * sheen * grain * k * edge;
+        return [b, b * 1.04, b * 1.1, 255];
+    };
+}
+
+const RED = [176, 28, 22];
+const YELLOW = [236, 182, 20];
+
+function accent(u, v) {
+    const g = 0.85 + 0.15 * hash(Math.floor(u * 8), Math.floor(v * 8));
+    return shade([RED[0], RED[1], RED[2], 255], g);
+}
+
+// Motor bell side: anodised red with dark cooling slots and a steel base ring.
+function motorSide(u, v) {
+    if (v > 0.78) { return [120, 122, 128, 255]; }
+    if (v > 0.18 && v < 0.6 && (u * 6) % 1 < 0.35) { return [25, 20, 20, 255]; }
+    const k = 0.7 + 0.5 * Math.sin(u * Math.PI);
+    return shade([RED[0], RED[1], RED[2], 255], k);
+}
+
+// Motor top: round bell with shaft and prop nut, transparent corners.
+function motorTop(u, v) {
+    const r = Math.hypot(u - 0.5, v - 0.5) * 2;
+    if (r > 1) { return null; }
+    if (r < 0.22) { return [200, 200, 205, 255]; }
+    if (r < 0.32) { return [40, 40, 44, 255]; }
+    if (r > 0.88) { return shade([RED[0], RED[1], RED[2], 255], 0.7); }
+    const spokes = Math.abs(Math.sin(Math.atan2(v - 0.5, u - 0.5) * 3)) < 0.35;
+    return spokes ? [30, 24, 24, 255] : shade([RED[0], RED[1], RED[2], 255], 1.05);
+}
+
+// LiPo: black shrink wrap, yellow brand band; end shows the balance lead.
+function batteryTop(u, v) {
+    if (v > 0.42 && v < 0.58) { return shade([YELLOW[0], YELLOW[1], YELLOW[2], 255], 0.95); }
+    const b = 22 + 8 * Math.sin(u * Math.PI);
+    return [b, b, b + 2, 255];
+}
+function batterySide(u, v) {
+    if (u > 0.42 && u < 0.58) { return shade([YELLOW[0], YELLOW[1], YELLOW[2], 255], 0.75); }
+    const b = 16 + 6 * Math.sin(v * Math.PI);
+    return [b, b, b + 2, 255];
+}
+function batteryEnd(u, v) {
+    if (Math.abs(u - 0.3) < 0.08 && v > 0.2 && v < 0.8) { return [200, 30, 30, 255]; }
+    if (Math.abs(u - 0.7) < 0.08 && v > 0.2 && v < 0.8) { return [20, 20, 20, 255]; }
+    return [28, 28, 30, 255];
+}
+
+// FPV camera: lens with a blue-green coating reflection.
+function camFront(u, v) {
+    const r = Math.hypot(u - 0.5, v - 0.5) * 2;
+    if (r < 0.62) {
+        const hl = Math.hypot(u - 0.4, v - 0.38) < 0.12;
+        if (hl) { return [180, 220, 230, 255]; }
+        return [20 + 30 * (1 - r), 40 + 70 * (1 - r), 60 + 60 * (1 - r), 255];
     }
-    if (segDist(u, v, 0.2, 0.2, 0.8, 0.8) < 0.035 || segDist(u, v, 0.8, 0.2, 0.2, 0.8) < 0.035) { return CARBON; }
-    if (Math.abs(u - 0.5) < 0.09 && Math.abs(v - 0.5) < 0.16) {
-        if (v < 0.37 && Math.abs(u - 0.5) < 0.05) { return [20, 20, 20, 255]; }   // FPV camera
-        return BODY;
+    if (r < 0.75) { return [60, 60, 66, 255]; }
+    return [34, 34, 38, 255];
+}
+function camSide(u, v) { const b = 36 + 10 * hash(Math.floor(u * 4), Math.floor(v * 4)); return [b, b, b + 3, 255]; }
+
+function antenna(u, v) {
+    if (v < 0.12) { return [190, 30, 30, 255]; }
+    const k = 0.7 + 0.5 * Math.sin(u * Math.PI);
+    return [20 * k, 20 * k, 22 * k, 255];
+}
+
+// Spinning prop: translucent disc with faint blade streaks.
+function propBlur(u, v) {
+    const dx = u - 0.5, dy = v - 0.5;
+    const r = Math.hypot(dx, dy) * 2;
+    if (r > 1 || r < 0.08) { return null; }
+    const ang = Math.atan2(dy, dx);
+    const streak = 0.5 + 0.5 * Math.cos(ang * 3);
+    const a = (40 + 50 * streak) * (r > 0.92 ? 1.6 : 1);
+    return [RED[0] * 0.6 + 40, RED[1] + 30, RED[2] + 30, Math.min(255, a)];
+}
+
+// Stopped prop: three tri-blades.
+function propStill(u, v) {
+    const dx = u - 0.5, dy = v - 0.5;
+    const r = Math.hypot(dx, dy) * 2;
+    if (r > 1) { return null; }
+    if (r < 0.12) { return [30, 30, 30, 255]; }
+    const ang = Math.atan2(dy, dx);
+    for (let i = 0; i < 3; i++) {
+        let d = ang - (i * 2 * Math.PI / 3 + 0.25 * r);
+        d = Math.atan2(Math.sin(d), Math.cos(d));
+        const width = 0.22 * (1 - r * 0.55);
+        if (Math.abs(d) < width) { return shade([RED[0], RED[1], RED[2], 230], 0.8 + 0.4 * (1 - r)); }
     }
-    if (Math.abs(u - 0.5) < 0.02 && v > 0.66 && v < 0.75) { return LED; }
     return null;
 }
 
-// Side strip: body stack + motor bells, drawn vertically across the quad.
-function droneSide(u, v) {
-    if (v > 0.35 && v < 0.75 && u > 0.38 && u < 0.62) { return BODY; }
-    if (v > 0.6 && v < 0.72 && u > 0.12 && u < 0.88) { return CARBON; }
-    for (const mx of [0.2, 0.8]) {
-        if (Math.abs(u - mx) < 0.05 && v > 0.3 && v < 0.62) { return [90, 90, 98, 255]; }
-        if (Math.abs(u - mx) < 0.16 && v > 0.26 && v < 0.31) { return [200, 200, 205, 160]; }
+// Radio: gunmetal body, two gimbals and a small screen.
+function radioFace(u, v) {
+    for (const gx of [0.27, 0.73]) {
+        const r = Math.hypot(u - gx, (v - 0.55) * 0.65);
+        if (r < 0.04) { return [210, 210, 215, 255]; }
+        if (r < 0.15) { return [18, 18, 20, 255]; }
+        if (r < 0.17) { return [90, 90, 96, 255]; }
     }
-    return null;
+    if (u > 0.4 && u < 0.6 && v > 0.15 && v < 0.35) { return [40, 120, 170, 255]; }
+    const b = 52 + 10 * Math.sin(v * Math.PI);
+    return [b, b + 2, b + 6, 255];
+}
+function radioSide(u, v) { const b = 44 + 8 * hash(Math.floor(u * 6), Math.floor(v * 6)); return [b, b + 1, b + 4, 255]; }
+function radioTop(u, v) {
+    for (const sx of [0.15, 0.3, 0.7, 0.85]) {
+        if (Math.abs(u - sx) < 0.025 && v > 0.3 && v < 0.7) { return [200, 200, 205, 255]; }
+    }
+    return radioSide(u, v);
 }
 
 // Impact flash: hot core fading through orange to transparent, with spikes.
@@ -138,10 +230,21 @@ function explosion(u, v) {
 
 function main() {
     fs.mkdirSync(OUT, { recursive: true });
-    fs.writeFileSync(path.join(OUT, 'drone_top.png'), png(128, 128, raster(128, 128, droneTop)));
-    fs.writeFileSync(path.join(OUT, 'drone_side.png'), png(128, 32, raster(128, 32, droneSide)));
-    fs.writeFileSync(path.join(OUT, 'explosion.png'), png(128, 128, raster(128, 128, explosion)));
-    console.log('wrote textures to ' + path.relative(process.cwd(), OUT));
+    for (const f of fs.readdirSync(OUT)) { if (f.endsWith('.png')) { fs.unlinkSync(path.join(OUT, f)); } }
+    const textures = {
+        carbon_top: carbon(1.25), carbon_side: carbon(0.8), carbon_bottom: carbon(0.55),
+        accent: accent, motor_top: motorTop, motor_side: motorSide,
+        battery_top: batteryTop, battery_side: batterySide, battery_end: batteryEnd,
+        cam_front: camFront, cam_side: camSide, antenna: antenna,
+        prop_blur: propBlur, prop_still: propStill,
+        radio_face: radioFace, radio_side: radioSide, radio_top: radioTop,
+        explosion: explosion
+    };
+    for (const name in textures) {
+        const size = name === 'explosion' || name.indexOf('prop') === 0 ? 128 : 64;
+        fs.writeFileSync(path.join(OUT, name + '.png'), png(size, size, raster(size, size, textures[name])));
+    }
+    console.log('wrote ' + Object.keys(textures).length + ' textures to ' + path.relative(process.cwd(), OUT));
 }
 
 main();

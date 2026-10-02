@@ -22,15 +22,20 @@ The mod doesn't modify any game files. You don't need to touch `B:\SteamLibrary\
 |---|---|
 | **F7** | Launch the drone or exit FPV mode. `/fpv` in chat also works. |
 | **F8** | Settings: controller mapping and calibration, rates, quad, camera, keybinds |
-| **E** | Arm / disarm (arming needs throttle low, like a real FC) |
+| **E** | Arm / disarm. On the keyboard, holding W on the ground also arms |
 | **R** | Reset the drone to the launch point |
 | **M** / **H** / **V** | Cycle flight mode / altitude assist / view (FPV, chase, line-of-sight) |
 | **C** | Swarm: call in a wingman |
 | **G** | Swarm: attack everything nearby (press again to call it off) |
 | **N** | Swarm: switch to the next drone |
-| W/S, A/D, arrow keys | Throttle, yaw, pitch and roll on the keyboard |
+| W/S, A/D, arrow keys | Climb/descend (Shift+W climbs faster), yaw, pitch and roll on the keyboard |
+| **F9** | Debug readout: input source, live sticks, UI/game rate, terrain probe |
 
 All keys can be rebound in F8 → Keys.
+
+New pilots start in angle mode with altitude assist. Let go of the keys and the quad holds its height and levels out. Switch to acro with M or your mode switch. The two small boxes at the bottom of the OSD show your sticks live, so you can see whether input is registering.
+
+When you launch, Rico stays where he's standing with a radio in his hand, and other players see the radio too. The quad sits on the ground a few steps in front of him, turned to face him.
 
 ### RadioMaster / RC transmitter
 
@@ -66,6 +71,13 @@ The tests cover the physics, the autopilot and swarm behaviours, and the full se
 None of this has been run inside the game yet. It's built against the JC3MP API as used by published packages (freecam, chat and Survival Island), and tested against a mock of that API. Expect some first-run tuning:
 
 - **Camera orientation.** JC3MP takes camera rotation as Euler angles, and the sign conventions were inferred from existing freecam code. If rolling or pitching turns the picture the wrong way, flip it in F8 → Camera. You only need to do this once and it's saved.
-- **Terrain collision.** JC3MP's client API has no raycast. The drone collides with sea level (water counts as a crash), with your launch spot, and with surfaces sampled from the game's aim ray (`localPlayer.lookAt`). Each sample is only kept if it lines up with your camera. In FPV you nearly always look at the ground ahead, so terrain gets mapped before you reach it. Wingmen use the same map, so they can clip terrain nobody has looked at.
+- **Terrain collision.** JC3MP's client API has no raycast (confirmed against the `types-jcmp` API definitions), so the drone can only collide with ground the mod knows about:
+  - sea level (water counts as a crash);
+  - an 8 m pad at your launch spot, at the height of Rico's feet;
+  - every spot where Rico or another player has stood still during the session;
+  - surfaces sampled from the game's aim ray (`localPlayer.lookAt`), which are only kept if they line up with your camera.
+
+  Each known point covers about 5 m around it. Anywhere the mod has no data, the drone and wingmen can pass through terrain. Press F9 while flying: if `probe` stays at 0, your game build's aim ray doesn't follow the detached camera, and only footprints and the launch pad hold the drone up.
 - **Damage scale.** Player health in JC3MP runs 0–800. Vehicle max health isn't exposed consistently, so vehicle damage is a fraction of `maxHealth`, falling back to 1000.
-- **Your character.** It stays frozen and invulnerable while you fly. It gets moved under the drone every 250 m so the world keeps streaming, and goes back to the launch point when you exit.
+- **Your character.** Rico stays frozen and invulnerable at the launch spot while you fly. If detail stops streaming in on very long flights, set `followDistance` in `config.js`; the server will then move him under the drone as you go, so he's no longer visible at the launch spot.
+- **The radio in Rico's hand.** It's attached to the `RIGHTHANDATTACH` bone. JC3MP doesn't expose animations, so Rico keeps his idle pose. The bone's axes aren't documented, so if the radio sits at an odd angle, adjust `FPV.TX_OFFSET` / `FPV.TX_ROT` in `src/client/model.js`.

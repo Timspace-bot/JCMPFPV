@@ -10,7 +10,10 @@
     };
 
     const DEG = Math.PI / 180;
-    const STORAGE_KEY = 'fpvdrone.settings.v1';
+    const STORAGE_KEY = 'fpvdrone.settings.v2';
+    const OLD_STORAGE_KEY = 'fpvdrone.settings.v1';
+    // Keys the game script uses for keyboard flying; forwarded as raw up/down.
+    const FLIGHT_KEYS = [87, 83, 65, 68, 88, 16, 37, 38, 39, 40];
     const CHANNELS = ['throttle', 'yaw', 'pitch', 'roll', 'arm', 'mode', 'call', 'attack', 'switch'];
     // Momentary channels: a rising edge (button press / switch flip) fires a command.
     const TRIGGERS = ['call', 'attack', 'switch'];
@@ -24,7 +27,8 @@
         ['view', 'Cycle view (FPV / chase / line of sight)'],
         ['call', 'Swarm: call in a wingman'],
         ['attack', 'Swarm: attack everything nearby / call off'],
-        ['switch', 'Swarm: switch to next drone']
+        ['switch', 'Swarm: switch to next drone'],
+        ['debug', 'Show input / terrain debug info']
     ];
 
     const PRESETS = {
@@ -62,8 +66,8 @@
                 battery: { enabled: true, cells: 4, capacityMah: 1500 }
             },
             camera: { eulerOrder: 'YXZ', pitchSign: -1, yawSign: -1, rollSign: -1, fovDeg: 92, modelRotSign: 1 },
-            mode: 'acro',
-            altHold: false,
+            mode: 'angle',
+            altHold: true,
             view: 'fpv',
             input: {
                 device: 'auto',
@@ -73,8 +77,8 @@
                 channels: JSON.parse(JSON.stringify(PRESETS.rc)),
                 cal: {}
             },
-            osd: { ahi: true, noise: true, name: '' },
-            keys: { toggle: 118, menu: 119, arm: 69, reset: 82, mode: 77, althold: 72, view: 86, call: 67, attack: 71, switch: 78 }
+            osd: { ahi: true, noise: true, name: '', sticks: true, debug: false },
+            keys: { toggle: 118, menu: 119, arm: 69, reset: 82, mode: 77, althold: 72, view: 86, call: 67, attack: 71, switch: 78, debug: 120 }
         };
     }
 
@@ -95,7 +99,18 @@
         const d = defaults();
         try {
             const raw = window.localStorage.getItem(STORAGE_KEY);
-            if (raw) { merge(d, JSON.parse(raw)); }
+            if (raw) {
+                merge(d, JSON.parse(raw));
+            } else {
+                // v1 -> v2: keep the pilot's mapping/rates/keys, but start on the
+                // new defaults (angle + altitude assist).
+                const old = window.localStorage.getItem(OLD_STORAGE_KEY);
+                if (old) {
+                    const o = JSON.parse(old);
+                    delete o.mode; delete o.altHold;
+                    merge(d, o);
+                }
+            }
         } catch (e) { /* storage unavailable */ }
         return d;
     }
@@ -108,7 +123,8 @@
 
     function pushSettings() {
         J.CallEvent('fpv/ui/settings', JSON.stringify({
-            tune: S.tune, camera: S.camera, mode: S.mode, altHold: S.altHold, view: S.view
+            tune: S.tune, camera: S.camera, mode: S.mode, altHold: S.altHold, view: S.view,
+            kbStrength: S.input.kbStrength
         }));
     }
 
@@ -121,8 +137,12 @@
     let chatOpen = false;
     let osd = null;
     const keys = {};
-    const kb = { t: 0, r: 0, p: 0, y: 0 };
     let armLatch = false;
+    // A controller only takes over once it is actually touched, so a phantom
+    // or idle HID device cannot hijack the sticks from the keyboard.
+    let padBaseline = null;     // {id, axes}
+    let padActive = false;
+    let tickCount = 0, tickHz = 0, tickWindow = Date.now();
     let prevButtons = {};
     let lastTick = Date.now();
     let detect = null;          // {channel, axes:[], buttons:[]}
@@ -276,45 +296,49 @@
         return out;
     }
 
-    // ---- keyboard sticks --------------------------------------------------
+    // ---- controller activity -----------------------------------------------
 
-    function readKeyboard(dt) {
-        const k = S.input.kbStrength;
-        const on = function (c) { return keys[c] && !chatOpen ? 1 : 0; };
-        const tr = (on(39) - on(37)) * k;
-        const tp = (on(38) - on(40)) * k;
-        const ty = (on(68) - on(65)) * k;
-        const a = Math.min(1, dt * 10);
-        kb.r += (tr - kb.r) * a;
-        kb.p += (tp - kb.p) * a;
-        kb.y += (ty - kb.y) * a;
-        if (S.altHold && S.mode !== 'acro') {
-            const tt = on(87) ? 1 : (on(83) ? 0 : 0.5);
-            kb.t += (tt - kb.t) * Math.min(1, dt * 6);
-        } else {
-            if (on(87)) { kb.t += 0.6 * dt; }
-            if (on(83)) { kb.t -= 0.9 * dt; }
-            if (on(88)) { kb.t = 0; }
-            kb.t = clamp(kb.t, 0, 1);
+    function padTouched(pad) {
+        if (S.input.device === 'gamepad') { return true; }
+        if (!padBaseline || padBaseline.id !== pad.id) {
+            padBaseline = { id: pad.id, axes: pad.axes.slice() };
+            padActive = false;
+            return false;
         }
-        return { t: kb.t, r: kb.r, p: kb.p, y: kb.y, arm: -2, mode: -2 };
+        if (padActive) { return true; }
+        for (let i = 0; i < pad.axes.length; i++) {
+            if (Math.abs(pad.axes[i] - (padBaseline.axes[i] || 0)) > 0.2) { padActive = true; }
+        }
+        for (let i = 0; i < pad.buttons.length; i++) {
+            if (rawButton(pad, i)) { padActive = true; }
+        }
+        return padActive;
     }
 
     // ---- main loop --------------------------------------------------------
 
+    let lastTickAt = 0;
+    let lastSent = null;
+
     function tick() {
         const now = Date.now();
-        const dt = Math.min((now - lastTick) / 1000, 0.1);
+        if (now - lastTickAt < 7) { return; }   // rAF and the interval both drive this
+        lastTickAt = now;
         lastTick = now;
+        tickCount++;
+        if (now - tickWindow >= 1000) { tickHz = tickCount; tickCount = 0; tickWindow = now; }
 
         const pad = getPad();
-        const usePad = pad && S.input.device !== 'keyboard';
-        const st = usePad ? readGamepad(pad) : readKeyboard(dt);
-
-        if (active || menuOpen) {
-            J.CallEvent('fpv/ui/sticks', st.t, st.r, st.p, st.y, st.arm, st.mode, usePad ? 'gamepad' : 'keyboard');
+        const usePad = pad && S.input.device !== 'keyboard' && padTouched(pad);
+        let st = null;
+        if (usePad) {
+            st = readGamepad(pad);
+            if (active || menuOpen) {
+                J.CallEvent('fpv/ui/sticks', st.t, st.r, st.p, st.y, st.arm, st.mode, 'gamepad');
+                lastSent = st;
+            }
         }
-        if (menuOpen) { updateMenuLive(pad, st); }
+        if (menuOpen) { updateMenuLive(pad, st || { t: 0, r: 0, p: 0, y: 0, arm: -2, mode: -2 }); }
         drawOsd(now);
     }
 
@@ -478,6 +502,55 @@
         }
         if (warn) { txt(warn, w / 2, h * 0.3, 'center', 26, o.crashed ? '#ff5252' : '#fff'); }
         if (sub) { txt(sub, w / 2, h * 0.3 + 28 * sc, 'center', 14, '#cfd8dc'); }
+
+        if (S.osd.sticks && o.sticks) { drawSticks(o, w, h, sc); }
+        if (S.osd.debug) { drawDebug(o, sc); }
+    }
+
+    // Two small gimbal boxes (mode 2: left = throttle/yaw, right = pitch/roll).
+    function drawSticks(o, w, h, sc) {
+        const size = 46 * sc, gap = 14 * sc;
+        const y0 = h * 0.9 - 70 * sc;
+        const boxes = [
+            { x: w / 2 - gap / 2 - size, sx: o.sticks.y, sy: o.sticks.t * 2 - 1 },
+            { x: w / 2 + gap / 2, sx: o.sticks.r, sy: o.sticks.p }
+        ];
+        ctx.save();
+        ctx.setLineDash ? ctx.setLineDash([]) : null;
+        boxes.forEach(function (b) {
+            ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(b.x, y0, size, size);
+            const px = b.x + size / 2 + clamp(b.sx, -1, 1) * size / 2;
+            const py = y0 + size / 2 - clamp(b.sy, -1, 1) * size / 2;
+            ctx.fillStyle = '#fff';
+            ctx.strokeStyle = '#000';
+            ctx.beginPath();
+            ctx.arc(px, py, 3.5 * sc, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+        });
+        txt(o.src === 'gamepad' ? 'RC' : 'KB', w / 2, y0 + size + 10 * sc, 'center', 11, '#cfd8dc');
+        ctx.restore();
+    }
+
+    function drawDebug(o, sc) {
+        const d = o.dbg || {};
+        const pad = getPad();
+        const lines = [
+            'INPUT ' + (o.src === 'gamepad' ? 'controller' : 'keyboard') + '   ui ' + tickHz + 'Hz   game ' + (o.fps || 0) + 'fps',
+            'STICKS T ' + o.sticks.t.toFixed(2) + ' Y ' + o.sticks.y.toFixed(2) + ' P ' + o.sticks.p.toFixed(2) + ' R ' + o.sticks.r.toFixed(2),
+            'PAD ' + (pad ? (pad.id || '?').slice(0, 40) + (padActive ? ' (active)' : ' (idle - move a stick)') : 'none') +
+                '   device ' + S.input.device,
+            'TERRAIN probe ' + (d.probeOk || 0) + '/' + (d.probeTries || 0) + '   samples ' + (d.samples || 0) +
+                '   floor ' + (d.floor !== undefined ? d.floor + 'm' : '?') + ' (' + (d.floorSrc || '?') + ')',
+            'ARMED ' + o.armed + '   mode ' + o.mode + (o.altHold ? '+AH' : '') + '   motor ' + Math.round((o.motor || 0) * 100) + '%'
+        ];
+        ctx.save();
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillRect(8 * sc, canvas.height * 0.17, 520 * sc, (lines.length * 17 + 10) * sc);
+        lines.forEach(function (l, i) { txt(l, 16 * sc, canvas.height * 0.17 + (14 + i * 17) * sc, 'left', 12, '#b2ff59'); });
+        ctx.restore();
     }
 
     // ---- settings menu ----------------------------------------------------
@@ -645,6 +718,7 @@
         $('cam-order').value = S.camera.eulerOrder;
         $('osd-ahi').checked = S.osd.ahi;
         $('osd-noise').checked = S.osd.noise;
+        $('osd-sticks').checked = S.osd.sticks;
         $('osd-name').value = S.osd.name;
         const rows = document.querySelectorAll('tr[data-axis]');
         for (let i = 0; i < rows.length; i++) {
@@ -670,7 +744,7 @@
     function wireForm() {
         $('in-device').addEventListener('change', function () { S.input.device = this.value; save(); });
         $('in-deadband').addEventListener('change', function () { S.input.deadband = clamp(num(this, 0.02), 0, 0.2); save(); });
-        $('in-kb').addEventListener('change', function () { S.input.kbStrength = clamp(num(this, 0.6), 0.1, 1); save(); });
+        $('in-kb').addEventListener('change', function () { S.input.kbStrength = clamp(num(this, 0.6), 0.1, 1); changed(); });
         $('in-mode').addEventListener('change', function () { S.mode = this.value; changed(); });
         $('in-althold').addEventListener('change', function () { S.altHold = this.checked; changed(); });
         $('cam-fov').addEventListener('change', function () { S.camera.fovDeg = clamp(num(this, 92), 40, 150); changed(); });
@@ -687,6 +761,7 @@
         });
         $('osd-ahi').addEventListener('change', function () { S.osd.ahi = this.checked; save(); });
         $('osd-noise').addEventListener('change', function () { S.osd.noise = this.checked; save(); });
+        $('osd-sticks').addEventListener('change', function () { S.osd.sticks = this.checked; save(); });
         $('osd-name').addEventListener('change', function () { S.osd.name = this.value; save(); });
 
         const rows = document.querySelectorAll('tr[data-axis]');
@@ -772,12 +847,14 @@
         const repeat = keys[code];
         keys[code] = true;
         if (repeat) { return; }
+        if (FLIGHT_KEYS.indexOf(code) >= 0) { J.CallEvent('fpv/ui/key', code, 1); }
+        if (code === S.keys.debug) { S.osd.debug = !S.osd.debug; save(); return; }
 
         if (code === S.keys.menu || (code === 27 && menuOpen)) { setMenu(!menuOpen); return; }
         if (code === S.keys.toggle) { J.CallEvent('fpv/ui/cmd', 'toggle'); return; }
         if (!active) { return; }
         if (code === S.keys.arm) { J.CallEvent('fpv/ui/cmd', 'arm'); }
-        else if (code === S.keys.reset) { kb.t = 0; J.CallEvent('fpv/ui/cmd', 'reset'); }
+        else if (code === S.keys.reset) { J.CallEvent('fpv/ui/cmd', 'reset'); }
         else if (code === S.keys.mode) { J.CallEvent('fpv/ui/cmd', 'mode'); }
         else if (code === S.keys.althold) { J.CallEvent('fpv/ui/cmd', 'althold'); }
         else if (code === S.keys.view) { J.CallEvent('fpv/ui/cmd', 'view'); }
@@ -786,16 +863,26 @@
         else if (code === S.keys.switch) { J.CallEvent('fpv/ui/cmd', 'switch'); }
     });
 
-    document.addEventListener('keyup', function (e) { keys[e.keyCode] = false; });
-    window.addEventListener('blur', function () { for (const k in keys) { keys[k] = false; } });
+    document.addEventListener('keyup', function (e) {
+        keys[e.keyCode] = false;
+        if (FLIGHT_KEYS.indexOf(e.keyCode) >= 0) { J.CallEvent('fpv/ui/key', e.keyCode, 0); }
+    });
+    function releaseAll() {
+        for (const k in keys) {
+            if (keys[k] && FLIGHT_KEYS.indexOf(+k) >= 0) { J.CallEvent('fpv/ui/key', +k, 0); }
+            keys[k] = false;
+        }
+    }
+    window.addEventListener('blur', releaseAll);
 
     // ---- events from the client script -------------------------------------
 
     J.AddEvent('fpv/active', function (on) {
         active = !!on;
         osd = null;
-        kb.t = 0; kb.r = 0; kb.p = 0; kb.y = 0;
         armLatch = false;
+        padActive = S.input.device === 'gamepad';
+        padBaseline = null;
     });
 
     J.AddEvent('fpv/osd', function (json) {
@@ -806,14 +893,13 @@
     J.AddEvent('fpv/feed', function (text) { feed(text); });
     J.AddEvent('fpv/chat', function (open) {
         chatOpen = !!open;
-        if (chatOpen) { for (const k in keys) { keys[k] = false; } }
+        if (chatOpen) { releaseAll(); }
     });
 
     J.AddEvent('fpv/mode_changed', function (mode, altHold) {
         const changedMode = mode !== S.mode;
         S.mode = mode;
         S.altHold = !!altHold;
-        if (S.altHold && S.mode !== 'acro') { kb.t = 0.5; }
         save();
         toast(changedMode ? 'Mode: ' + mode.toUpperCase() : 'Altitude assist ' + (S.altHold ? 'ON' : 'OFF'));
     });
@@ -830,7 +916,8 @@
 
     wireForm();
     fillForm();
-    setInterval(tick, 16);
+    setInterval(tick, 10);
+    (function raf() { tick(); window.requestAnimationFrame(raf); })();
     pushSettings();
     J.CallEvent('fpv/ui/ready');
 
@@ -840,7 +927,10 @@
         osd = { armed: true, crashed: false, mode: 'angle', altHold: true, view: 'fpv', thr: 0.42, speed: 87, vspeed: 1.3,
             alt: 34, home: 412, homeDir: 0.6, pitch: -0.3, roll: 0.25, tilt: 25, cell: 3.82, cells: 4, mah: 512,
             cap: 1500, batt: true, amps: 31, time: 83, noise: 0.15, probe: true,
-            swarm: { n: 3, max: 5, mode: 'support', atk: 0, id: 2 }, banner: 'LINK > W2  AUTO-AIM' };
+            swarm: { n: 3, max: 5, mode: 'support', atk: 0, id: 2 }, banner: 'LINK > W2  AUTO-AIM',
+            sticks: { t: 0.55, y: -0.2, p: 0.4, r: 0.15 }, src: 'keyboard', fps: 60,
+            dbg: { probeOk: 812, probeTries: 1400, samples: 655, floor: -3.2, floorSrc: 'map', pad: false } };
+        S.osd.debug = /debug/.test(location.search);
         if (/menu/.test(location.search)) { setMenu(true); }
     }
 })();

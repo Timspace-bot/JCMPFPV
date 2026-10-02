@@ -4,17 +4,22 @@ const assert = require('node:assert');
 require('../tools/build.js').build();
 const { Server, Vector3f } = require('./harness');
 
-function setup() {
+// Most scenarios fly like an RC pilot in acro (the shipped default for new
+// pilots is angle + altitude assist, covered by the keyboard tests below).
+function setup(opts) {
     const server = new Server();
     const a = server.connect('Alice');
     const b = server.connect('Bob');
     a.ui('fpv/ui/ready');
     b.ui('fpv/ui/ready');
+    if (!opts || !opts.defaults) {
+        a.ui('fpv/ui/settings', JSON.stringify({ mode: 'acro', altHold: false }));
+    }
     return { server, a, b };
 }
 
 function sticks(c, t, roll, pitch, yaw) {
-    c.ui('fpv/ui/sticks', t, roll || 0, pitch || 0, yaw || 0, -2, -2, 'keyboard');
+    c.hold(t, roll, pitch, yaw);
 }
 
 test('launch, arm, fly, relay to other players, land', () => {
@@ -114,17 +119,24 @@ test('arm switch on a transmitter needs a fresh flip to arm', () => {
     const { server, a } = setup();
     a.ui('fpv/ui/cmd', 'toggle');
     // Switch already ON when launching -> must not arm.
-    a.ui('fpv/ui/sticks', 0, 0, 0, 0, 1, -0.9, 'gamepad');
+    a.hold(0, 0, 0, 0, 1, -0.9);
     server.run(0.1);
     assert.strictEqual(JSON.parse(a.lastUi('fpv/osd')[0]).armed, false);
-    a.ui('fpv/ui/sticks', 0, 0, 0, 0, -1, -0.9, 'gamepad');
-    a.ui('fpv/ui/sticks', 0, 0, 0, 0, 1, -0.9, 'gamepad');
+    a.hold(0, 0, 0, 0, -1, -0.9);
+    a.hold(0, 0, 0, 0, 1, -0.9);
     server.run(0.1);
     assert.strictEqual(JSON.parse(a.lastUi('fpv/osd')[0]).armed, true);
     // Mode switch high -> angle.
-    a.ui('fpv/ui/sticks', 0, 0, 0, 0, 1, 1, 'gamepad');
+    a.hold(0, 0, 0, 0, 1, 1);
     server.run(0.1);
     assert.strictEqual(JSON.parse(a.lastUi('fpv/osd')[0]).mode, 'angle');
+    // A switch that sits at OFF does not fight the keyboard: E still toggles.
+    a.hold(0, 0, 0, 0, -1, 1);
+    server.run(0.1);
+    assert.strictEqual(JSON.parse(a.lastUi('fpv/osd')[0]).armed, false, 'flipping the switch off disarms');
+    a.ui('fpv/ui/cmd', 'arm');
+    server.run(0.2);
+    assert.strictEqual(JSON.parse(a.lastUi('fpv/osd')[0]).armed, true, 'E arms with the switch left off');
 });
 
 test('server: follow only moves the character to the real drone position', () => {
@@ -167,6 +179,7 @@ test('server denies launch from a vehicle and when disabled', () => {
 function osdOf(c) { return JSON.parse(c.lastUi('fpv/osd')[0]); }
 
 function hover(server, a, alt) {
+    a.ui('fpv/ui/settings', JSON.stringify({ mode: 'angle', altHold: true }));
     a.ui('fpv/ui/settings', JSON.stringify({ mode: 'angle', altHold: true }));
     a.ui('fpv/ui/cmd', 'toggle');
     sticks(a, 0.5);
@@ -265,4 +278,68 @@ test('swarm attack with nothing in range reports it; full swarm refuses more cal
     server.run(1);
     a.ui('fpv/ui/cmd', 'attack');
     assert.ok(/No targets/.test(a.lastUi('fpv/notify')[0]), a.lastUi('fpv/notify')[0]);
+});
+
+test('keyboard: hold W to take off, let go to hover, arrows fly forward', () => {
+    const { server, a } = setup({ defaults: true });
+    a.ui('fpv/ui/cmd', 'toggle');
+    server.run(0.5);
+    let o = osdOf(a);
+    assert.strictEqual(o.mode, 'angle');
+    assert.strictEqual(o.altHold, true);
+    assert.strictEqual(o.armed, false);
+    a.key(87, true);                      // W
+    server.run(3);
+    o = osdOf(a);
+    assert.strictEqual(o.armed, true, 'W arms on the ground');
+    assert.ok(o.alt > 5, 'climbing: ' + o.alt);
+    a.key(87, false);
+    server.run(1.5);
+    const alt = osdOf(a).alt;
+    server.run(2);
+    assert.ok(Math.abs(osdOf(a).alt - alt) < 1.5, 'holds height');
+    a.key(38, true);                      // Up arrow
+    server.run(2);
+    assert.ok(osdOf(a).speed > 20, 'moving forward: ' + osdOf(a).speed);
+    a.key(38, false);
+    assert.strictEqual(osdOf(a).src, 'keyboard');
+    assert.deepStrictEqual(a.errors, []);
+});
+
+test('Rico stays where he launched and holds the radio; drone starts on the ground facing him', () => {
+    const { server, a, b } = setup({ defaults: true });
+    const start = { x: a.player.position.x, y: a.player.position.y, z: a.player.position.z };
+    a.ui('fpv/ui/cmd', 'toggle');
+    server.run(0.3);
+    let o = osdOf(a);
+    assert.ok(Math.abs(o.alt) < 0.3, 'on the ground: ' + o.alt);
+    assert.ok(o.home > 1.5 && o.home < 4, 'a few steps from Rico: ' + o.home);
+    assert.ok(Math.abs(Math.abs(o.homeDir) - 0) < 0.2, 'facing Rico (home straight ahead): ' + o.homeDir);
+
+    const ra = a.frame();
+    const radioTex = 'package://fpvdrone/textures/radio_face.png';
+    assert.ok(ra.byTexture[radioTex] >= 1, 'local radio drawn');
+    assert.ok(b.frame().byTexture[radioTex] >= 1, 'Bob sees the radio in Alice\'s hand');
+    assert.strictEqual(ra.culling, false, 'culling off for double-sided faces');
+
+    // Fly far away: the character must not be moved.
+    a.key(87, true);
+    server.run(3);
+    a.key(87, false);
+    a.key(38, true);
+    server.run(15);
+    a.key(38, false);
+    assert.ok(osdOf(a).home > 200, 'flew ' + osdOf(a).home);
+    assert.deepStrictEqual({ x: a.player.position.x, y: a.player.position.y, z: a.player.position.z }, start, 'Rico did not move');
+    assert.strictEqual(a.lp.frozen, true);
+});
+
+test('the quad model is drawn with the textured 3D parts', () => {
+    const { server, a, b } = setup();
+    a.ui('fpv/ui/cmd', 'toggle');
+    server.run(0.2);
+    const rb = b.frame();
+    const tex = (n) => rb.byTexture['package://fpvdrone/textures/' + n + '.png'] || 0;
+    assert.ok(tex('carbon_top') >= 5 && tex('motor_side') >= 16 && tex('prop_still') === 4 && tex('cam_front') === 1,
+        JSON.stringify(rb.byTexture));
 });

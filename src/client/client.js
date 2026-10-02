@@ -15,7 +15,7 @@ const cfg = {
     enabled: true,
     seaLevel: 1024,
     syncRateHz: 20,
-    followDistance: 250,
+    followDistance: 0,
     followDepth: 40,
     videoRange: 2500,
     maxAltitude: 4500,
@@ -28,9 +28,10 @@ const cfg = {
 const settings = {
     tune: FPV.cloneTune(FPV.DEFAULT_TUNE),
     camera: { eulerOrder: 'YXZ', pitchSign: -1, yawSign: -1, rollSign: -1, fovDeg: 92, modelRotSign: 1 },
-    mode: 'acro',
-    altHold: false,
-    view: 'fpv'
+    mode: 'angle',
+    altHold: true,
+    view: 'fpv',
+    kbStrength: 0.6
 };
 
 let tune = FPV.cloneTune(FPV.DEFAULT_TUNE);
@@ -60,11 +61,27 @@ let banner = null;              // {text, until} short OSD banner
 const effects = [];             // impact flashes [{pos, t0}]
 const targetTracks = {};        // key -> {pos, t} for velocity estimates
 
-const input = { throttle: 0, roll: 0, pitch: 0, yaw: 0, mode: 'acro', altHold: false, source: 'keyboard' };
+const input = { throttle: 0, roll: 0, pitch: 0, yaw: 0, mode: 'angle', altHold: true, source: 'keyboard' };
+
+// Keyboard flying is integrated here, per game frame, from raw key events the
+// UI forwards (UI timers can be throttled by CEF; key events are not).
+const KEY = { W: 87, S: 83, A: 65, D: 68, X: 88, SHIFT: 16, LEFT: 37, UP: 38, RIGHT: 39, DOWN: 40 };
+const keys = {};
+const kb = { t: 0, r: 0, p: 0, y: 0 };
+let padSticks = null;           // latest controller sticks from the UI
+let padAt = 0;                  // when they arrived
+let fps = 0;
+
+// Bones (see types-jcmp LocalPlayer.GetBoneTransform).
+const BONE_RIGHT_HAND_ATTACH = 0x65C5D2EB;
+const BONE_LEFT_FOOT = 0x661134AC;
+const BONE_RIGHT_FOOT = 0xFF3E004B;
+const ANKLE_HEIGHT = 0.07;
 
 const world = new FPV.World(cfg.seaLevel);
 const remotes = new FPV.Remotes();
 const renderer = new FPV.RemoteRenderer();
+const models = new FPV.ModelRenderer();
 let swarm = new FPV.Swarm({}, tune);
 
 const ui = new WebUIWindow('fpvdrone', 'package://fpvdrone/ui/index.html',
@@ -102,6 +119,119 @@ function rebuildTune() {
 
 function swarmEnabled() { return cfg.swarm.enabled !== false; }
 
+// ---- ground truth from characters --------------------------------------------
+
+function boneY(player, bone, dtf) {
+    try {
+        const m = player.GetBoneTransform(bone, dtf || 0);
+        const p = m && m.position;
+        return p && isFinite(p.y) ? p.y : null;
+    } catch (e) { return null; }
+}
+
+// Ground height under Rico from his foot bones (falls back to his position).
+function groundUnderLocalPlayer(dtf) {
+    const lp = jcmp.localPlayer;
+    if (typeof lp.GetBoneTransform !== 'function') { return null; }
+    const l = boneY(lp, BONE_LEFT_FOOT, dtf), r = boneY(lp, BONE_RIGHT_FOOT, dtf);
+    if (l === null && r === null) { return null; }
+    const foot = Math.min(l === null ? Infinity : l, r === null ? Infinity : r) - ANKLE_HEIGHT;
+    // Only trust it if the feet are near the character root (standing, not
+    // swinging from the grapple or skydiving).
+    return Math.abs(foot - lp.position.y) < 0.6 ? Math.min(foot, lp.position.y + 0.05) : null;
+}
+
+// While on foot (and for other players), every place a character stands is a
+// known piece of ground the drone can land on later.
+const footTracks = {};
+let lastFootprint = 0;
+function recordFootprints(now) {
+    if (now - lastFootprint < 300) { return; }
+    lastFootprint = now;
+    function track(key, pos) {
+        const prev = footTracks[key];
+        footTracks[key] = { pos: pos, t: now };
+        if (prev && now - prev.t < 1000 && Math.abs(prev.pos.y - pos.y) < 0.08 &&
+            FPV.dist(prev.pos, pos) < 8) {
+            world.addGround(pos.x, pos.y, pos.z);
+        }
+    }
+    if (status !== 'flying') {
+        const g = groundUnderLocalPlayer();
+        if (g !== null) {
+            const p = jcmp.localPlayer.position;
+            track('me', { x: p.x, y: g, z: p.z });
+        }
+    }
+    if (jcmp.players) {
+        for (let i = 0; i < jcmp.players.length; i++) {
+            const p = jcmp.players[i];
+            if (!p || p.networkId === jcmp.localPlayer.networkId || remotes.pilots[p.networkId] !== undefined) { continue; }
+            const pp = p.position;
+            if (pp) { track('p' + p.networkId, { x: pp.x, y: pp.y, z: pp.z }); }
+        }
+    }
+}
+
+// The radio in Rico's hands (ours, and every other pilot's).
+function drawRadios(r) {
+    if (status === 'flying' && typeof jcmp.localPlayer.GetBoneTransform === 'function') {
+        models.drawRadio(r, function () { return jcmp.localPlayer.GetBoneTransform(BONE_RIGHT_HAND_ATTACH, r.dtf || 0); });
+    }
+    if (!jcmp.players) { return; }
+    for (let i = 0; i < jcmp.players.length; i++) {
+        const p = jcmp.players[i];
+        if (!p || remotes.pilots[p.networkId] === undefined || typeof p.GetBoneTransform !== 'function') { continue; }
+        models.drawRadio(r, function () { return p.GetBoneTransform(BONE_RIGHT_HAND_ATTACH, r.dtf || 0); });
+    }
+}
+
+// ---- keyboard sticks --------------------------------------------------------
+
+function keyboardActive() {
+    return keys[KEY.W] || keys[KEY.S] || keys[KEY.A] || keys[KEY.D] || keys[KEY.X] ||
+        keys[KEY.LEFT] || keys[KEY.RIGHT] || keys[KEY.UP] || keys[KEY.DOWN];
+}
+
+function updateKeyboardSticks(dt) {
+    const k = settings.kbStrength;
+    const on = function (c) { return keys[c] && !chatOpen ? 1 : 0; };
+    const a = Math.min(1, dt * 12);
+    kb.r += ((on(KEY.RIGHT) - on(KEY.LEFT)) * k - kb.r) * a;
+    kb.p += ((on(KEY.UP) - on(KEY.DOWN)) * k - kb.p) * a;
+    kb.y += ((on(KEY.D) - on(KEY.A)) * k - kb.y) * a;
+    if (settings.altHold && settings.mode !== 'acro') {
+        // Centre = hover; W climbs, S descends, Shift+W climbs at full rate.
+        const tt = on(KEY.W) ? (on(KEY.SHIFT) ? 1 : 0.85) : (on(KEY.S) ? 0.1 : 0.5);
+        kb.t += (tt - kb.t) * Math.min(1, dt * 8);
+    } else {
+        if (on(KEY.W)) { kb.t += (on(KEY.SHIFT) ? 2.0 : 0.9) * dt; }
+        if (on(KEY.S)) { kb.t -= 1.2 * dt; }
+        if (on(KEY.X)) { kb.t = 0; }
+        kb.t = FPV.clamp(kb.t, 0, 1);
+    }
+}
+
+// Pick the live input: a controller that is sending, unless flight keys are held.
+function resolveInput(now, dt) {
+    updateKeyboardSticks(dt);
+    const padLive = padSticks && now - padAt < 400;
+    if (padLive && !keyboardActive()) {
+        input.throttle = padSticks.t; input.roll = padSticks.r; input.pitch = padSticks.p; input.yaw = padSticks.y;
+        input.source = 'gamepad';
+    } else {
+        input.throttle = kb.t; input.roll = kb.r; input.pitch = kb.p; input.yaw = kb.y;
+        input.source = 'keyboard';
+        // Keyboard pilots: throttling up on the ground arms the quad.
+        if (keys[KEY.W] && drone && !drone.armed && !drone.inWater && !handover && drone.onGround) {
+            const t = input.throttle;
+            input.throttle = 0;   // the key press is the arm gesture, not a throttle-up
+            armRequest(true);
+            input.throttle = t;
+        }
+    }
+}
+
 // ---- start / stop ----------------------------------------------------------
 
 function requestStart() {
@@ -114,17 +244,23 @@ function requestStart() {
 
 function begin() {
     const lp = jcmp.localPlayer;
+    // Rico stays where he is; the quad sits on the ground a few steps in front
+    // of him, turned round to face him.
     launch = fromVec3f(lp.position);
-    const heading = FPV.fromGameYaw(lp.camera.rotation.y, settings.camera);
-    const fwd = FPV.qRotate(heading, { x: 0, y: 0, z: -1 });
+    const ground = groundUnderLocalPlayer();
+    if (ground !== null) { launch.y = ground; }
+    const look = FPV.fromGameYaw(lp.camera.rotation.y, settings.camera);
+    const fwd = FPV.qRotate(look, { x: 0, y: 0, z: -1 });
+    const heading = FPV.qMul(look, FPV.qAxisAngle({ x: 0, y: 1, z: 0 }, Math.PI));
 
     world.seaLevel = cfg.seaLevel;
     world.reset();
-    world.addPad(launch.x, launch.y, launch.z, 6.0);
+    world.addPad(launch.x, launch.y, launch.z, 8.0);
+    world.addGround(launch.x, launch.y, launch.z);
 
     swarm = new FPV.Swarm({}, tune);
     rebuildTune();
-    const start = FPV.add(launch, { x: fwd.x * 1.5, y: tune.collisionRadius, z: fwd.z * 1.5 });
+    const start = FPV.add(launch, { x: fwd.x * 2.5, y: tune.collisionRadius, z: fwd.z * 2.5 });
     drone = FPV.createState(start, heading);
     drone.onGround = true;
     droneId = 0;
@@ -144,9 +280,11 @@ function begin() {
     chaseYaw = FPV.yawOf(heading);
     armSwitchPrev = null;
     armBlockedReason = '';
+    kb.t = settings.altHold && settings.mode !== 'acro' ? 0.5 : 0;
+    for (const k in keys) { keys[k] = false; }
     status = 'flying';
     jcmp.ui.CallEvent('fpv/active', true);
-    notify('Drone ready - arm to take off (E or your arm switch)', 'info');
+    notify('Drone ready - hold W to take off (or arm with E / your arm switch)', 'info');
 }
 
 function end(tellServer) {
@@ -174,7 +312,7 @@ function resetDrone() {
     drone = FPV.createState(FPV.add(launch, { x: fwd.x * 1.5, y: tune.collisionRadius, z: fwd.z * 1.5 }), heading);
     drone.onGround = true;
     armSwitchPrev = null;
-    jcmp.events.CallRemote('fpv/follow', launch.x, launch.y, launch.z, 1);
+    if (cfg.followDistance) { jcmp.events.CallRemote('fpv/follow', launch.x, launch.y, launch.z, 1); }
     lastFollow = { x: launch.x, y: launch.y, z: launch.z };
     notify('Drone reset to launch point', 'info');
 }
@@ -497,6 +635,16 @@ function sendOsd(now) {
         time: drone.flightTime,
         noise: noise,
         probe: world.probeValid,
+        fps: Math.round(fps),
+        sticks: { t: input.throttle, r: input.roll, p: input.pitch, y: input.yaw },
+        dbg: {
+            probeOk: world.validSamples,
+            probeTries: world.probeTries,
+            samples: world.sampleCount(),
+            floor: Math.round((world.floorAt(s.pos).y - launch.y) * 10) / 10,
+            floorSrc: world.lastSrc,
+            pad: !!(padSticks && now - padAt < 400)
+        },
         src: input.source,
         swarm: swarmEnabled() ? {
             n: swarm.flying().length,
@@ -513,10 +661,10 @@ function sendOsd(now) {
 function ownPoses() {
     const poses = [];
     const viewing = handover ? handover.w.s : drone;
-    if (drone && (settings.view !== 'fpv' || viewing !== drone)) { poses.push({ pos: drone.pos, q: drone.q }); }
+    if (drone && (settings.view !== 'fpv' || viewing !== drone)) { poses.push({ pos: drone.pos, q: drone.q, armed: drone.armed }); }
     swarm.wingmen.forEach(function (w) {
         if (settings.view === 'fpv' && w.s === viewing) { return; }
-        poses.push({ pos: w.s.pos, q: w.s.q });
+        poses.push({ pos: w.s.pos, q: w.s.q, armed: w.s.armed && !w.s.crashed });
     });
     return poses;
 }
@@ -532,9 +680,14 @@ function frame(r) {
     remotes.update(now);
     const camPos = fromVec3f(jcmp.localPlayer.camera.position);
     const poses = [];
-    for (const k in remotes.list) { if (remotes.list[k].pose) { poses.push(remotes.list[k].pose); } }
+    for (const k in remotes.list) {
+        const rm = remotes.list[k];
+        if (rm.pose) { poses.push({ pos: rm.pose.pos, q: rm.pose.q, armed: !!(rm.flags & FPV.FLAG_ARMED) }); }
+    }
     if (status === 'flying' && drone) { Array.prototype.push.apply(poses, ownPoses()); }
-    renderer.draw3d(r, poses, camPos, settings.camera.modelRotSign);
+    models.drawQuads(r, poses, camPos, settings.camera.modelRotSign, tune.cameraTiltDeg, now / 1000);
+    drawRadios(r);
+    recordFootprints(now);
 
     if (status !== 'flying' || !drone) { return; }
 
@@ -542,9 +695,11 @@ function frame(r) {
     lastFrame = now;
     if (!(dt > 0)) { dt = 0; }
     if (dt > 0.1) { dt = 0.1; }   // hitch / alt-tab: don't explode
+    if (dt > 0) { fps += (1 / dt - fps) * 0.05; }
 
     input.mode = settings.mode;
     input.altHold = settings.altHold;
+    resolveInput(now, dt);
 
     acc += dt;
     while (acc >= STEP) {
@@ -638,21 +793,30 @@ jcmp.ui.AddEvent('fpv/ui/menu', (open) => {
     if (status !== 'flying') { jcmp.localPlayer.controlsEnabled = !menuOpen && !chatOpen; }
 });
 
-// Sticks arrive already mapped/calibrated by the UI (gamepad or keyboard).
-// arm/mode are -2 when the pilot has not mapped a switch.
-jcmp.ui.AddEvent('fpv/ui/sticks', (t, roll, pitch, yaw, arm, mode, source) => {
-    input.throttle = FPV.clamp(+t || 0, 0, 1);
-    input.roll = FPV.clamp(+roll || 0, -1, 1);
-    input.pitch = FPV.clamp(+pitch || 0, -1, 1);
-    input.yaw = FPV.clamp(+yaw || 0, -1, 1);
-    input.source = source;
-    if (!drone || chatOpen) { return; }
+// Raw key state for keyboard flying (see updateKeyboardSticks).
+jcmp.ui.AddEvent('fpv/ui/key', (code, down) => {
+    keys[code] = !!down && !chatOpen;
+});
 
+// Controller sticks, already mapped/calibrated by the UI. Only sent while a
+// controller is actually in use. arm/mode are -2 when no switch is mapped.
+jcmp.ui.AddEvent('fpv/ui/sticks', (t, roll, pitch, yaw, arm, mode) => {
+    padSticks = {
+        t: FPV.clamp(+t || 0, 0, 1),
+        r: FPV.clamp(+roll || 0, -1, 1),
+        p: FPV.clamp(+pitch || 0, -1, 1),
+        y: FPV.clamp(+yaw || 0, -1, 1)
+    };
+    padAt = Date.now();
+    if (!drone || chatOpen) { return; }
+    input.throttle = padSticks.t;   // so arming checks see the real stick
+
+    // The arm switch acts on flips only, so E on the keyboard keeps working
+    // and a switch left on at launch does not arm the quad by itself.
     if (arm > -1.5) {
         const on = arm > 0.5;
         if (armSwitchPrev !== null && on !== armSwitchPrev) { armRequest(on); }
         armSwitchPrev = on;
-        if (!on && drone.armed && !handover) { FPV.disarm(drone); }
     }
     if (mode > -1.5) {
         const m = mode < -0.33 ? 'acro' : (mode > 0.33 ? 'angle' : 'horizon');
@@ -678,6 +842,7 @@ jcmp.ui.AddEvent('fpv/ui/settings', (json) => {
     }
     if (MODES.indexOf(s.mode) >= 0) { settings.mode = s.mode; }
     if (typeof s.altHold === 'boolean') { settings.altHold = s.altHold; }
+    if (isFinite(s.kbStrength)) { settings.kbStrength = FPV.clamp(+s.kbStrength, 0.1, 1); }
     if (VIEWS.indexOf(s.view) >= 0) { settings.view = s.view; }
     rebuildTune();
     if (status === 'flying') { jcmp.localPlayer.camera.fieldOfView = settings.camera.fovDeg * FPV.DEG; }

@@ -9,7 +9,7 @@ const SRC = path.join(__dirname, '..', 'src', 'client');
 
 function loadPure() {
     const ctx = vm.createContext({ Math: Math, JSON: JSON, Infinity: Infinity, isFinite: isFinite, FPV: {} });
-    for (const f of ['math.js', 'physics.js', 'world.js', 'swarm.js']) {
+    for (const f of ['math.js', 'physics.js', 'world.js', 'swarm.js', 'model.js']) {
         vm.runInContext(fs.readFileSync(path.join(SRC, f), 'utf8'), ctx, { filename: f });
     }
     return ctx.FPV;

@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // remote.js - other players' drones (snapshot buffer + interpolation) and the
-// renderer used for every drone that is not the one we are looking through.
+// 2D overlay (name tags, impact flashes). The 3D quads are drawn by model.js.
 // ---------------------------------------------------------------------------
 
 FPV.INTERP_DELAY_MS = 120;
@@ -79,45 +79,14 @@ FPV.Remotes.prototype.update = function (now) {
 
 FPV.RemoteRenderer = function () {
     this.ready = false;
-    this.size = 0.5;          // drawn a bit larger than a real 5" quad so it is visible
-    this.nameColor = new RGBA(255, 255, 255, 230);
     this.shadow = new RGBA(0, 0, 0, 200);
-    this.armedColor = new RGBA(80, 255, 120, 230);
+    this.nameColor = new RGBA(255, 255, 255, 230);
     this.maxText = new Vector2f(1000, 100);
-    this.xAxis = new Vector3f(1, 0, 0);
     try {
-        this.texTop = new Texture('package://fpvdrone/textures/drone_top.png');
-        this.texSide = new Texture('package://fpvdrone/textures/drone_side.png');
         this.texBoom = new Texture('package://fpvdrone/textures/explosion.png');
         this.ready = true;
     } catch (e) {
         if (typeof jcmp.print === 'function') { jcmp.print('[fpvdrone] could not load textures: ' + e); }
-    }
-};
-
-// 3D pass (GameUpdateRender): textured quads at each pose [{pos, q}].
-FPV.RemoteRenderer.prototype.draw3d = function (r, poses, camPos, modelRotSign) {
-    if (!this.ready) { return; }
-    const half = this.size / 2;
-    const topPos = new Vector3f(-half, -half, 0);
-    const topSize = new Vector2f(this.size, this.size);
-    const sideH = this.size * 0.25;
-    const sidePos = new Vector3f(-half, -sideH / 2, 0);
-    const sideSize = new Vector2f(this.size, sideH);
-    for (let i = 0; i < poses.length; i++) {
-        const p = poses[i];
-        if (FPV.dist(p.pos, camPos) > 1500 || FPV.dist(p.pos, camPos) < 0.3) { continue; }
-        const aa = FPV.qToAxisAngle(p.q);
-        const pos = new Vector3f(p.pos.x, p.pos.y, p.pos.z);
-        const axis = new Vector3f(aa.axis.x, aa.axis.y, aa.axis.z);
-        const angle = aa.angle * modelRotSign;
-        // Matrices are rebuilt rather than reused in case Matrix ops mutate.
-        // Top-down silhouette lying in the body XZ plane...
-        r.SetTransform(new Matrix().Translate(pos).Rotate(angle, axis).Rotate(Math.PI / 2, this.xAxis));
-        r.DrawTexture(this.texTop, topPos, topSize);
-        // ...plus a vertical strip across the body so it is visible edge-on.
-        r.SetTransform(new Matrix().Translate(pos).Rotate(angle, axis));
-        r.DrawTexture(this.texSide, sidePos, sideSize);
     }
 };
 

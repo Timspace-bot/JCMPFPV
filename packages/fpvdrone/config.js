@@ -18,15 +18,16 @@ module.exports = {
     syncRateHz: 20,
     syncRange: 1500,
 
-    // The world only streams in around your character, so while you fly the
-    // server moves your frozen character along underneath the drone every
-    // `followDistance` metres, `followDepth` metres below it. Set
-    // followDistance to 0 to disable (you will run out of streamed world).
-    followDistance: 250,
+    // Rico stays standing where he launched from, radio in hand. Optionally the
+    // server can drag the (frozen) character along under the drone every
+    // `followDistance` metres (`followDepth` below it) so the world keeps
+    // streaming in on very long flights - but then he is no longer visible at
+    // the launch spot. 0 = never move him.
+    followDistance: 0,
     followDepth: 40,
 
     // Put the pilot's character back where they launched from when they exit
-    // FPV mode. If false they are dropped at the last follow point.
+    // FPV mode (only matters if followDistance moved him).
     returnToLaunch: true,
 
     // Make the pilot's (frozen) character invulnerable while flying.

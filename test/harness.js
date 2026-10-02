@@ -17,10 +17,11 @@ class Vector2f { constructor(x, y) { this.x = x; this.y = y; } }
 class Vector2 { constructor(x, y) { this.x = x; this.y = y; } }
 class RGBA { constructor(r, g, b, a) { this.r = r; this.g = g; this.b = b; this.a = a; } }
 class Matrix {
-    constructor(ops) { this.ops = ops || []; }
-    Translate(v) { assertVec(v); return new Matrix(this.ops.concat([['T', v]])); }
-    Rotate(a, v) { if (!isFinite(a)) { throw new Error('bad angle'); } assertVec(v); return new Matrix(this.ops.concat([['R', a, v]])); }
-    Scale(v) { return new Matrix(this.ops.concat([['S', v]])); }
+    constructor(ops, pos) { this.ops = ops || []; this.pos = pos || new Vector3f(0, 0, 0); }
+    get position() { return this.pos; }
+    Translate(v) { assertVec(v); return new Matrix(this.ops.concat([['T', v]]), this.pos); }
+    Rotate(a, v) { if (!isFinite(a)) { throw new Error('bad angle'); } assertVec(v); return new Matrix(this.ops.concat([['R', a, v]]), this.pos); }
+    Scale(v) { assertVec(v); return new Matrix(this.ops.concat([['S', v]]), this.pos); }
 }
 class Texture { constructor(p) { this.path = p; } }
 
@@ -32,8 +33,13 @@ function assertVec(v) {
 
 function makeRenderer() {
     const r = { draws: 0, texts: 0, transforms: 0, flashes: 0 };
+    r.dtf = 0.016;
+    r.culling = null;
+    r.EnableCulling = (on) => { r.culling = on; };
     r.SetTransform = (m) => { if (!(m instanceof Matrix)) { throw new Error('SetTransform needs Matrix'); } r.transforms++; };
+    r.byTexture = {};
     r.DrawTexture = (t, p, s) => {
+        r.byTexture[t.path] = (r.byTexture[t.path] || 0) + 1;
         if (!(t instanceof Texture)) { throw new Error('bad texture'); }
         if (p instanceof Vector2f) { if (!isFinite(p.x) || !isFinite(p.y)) { throw new Error('bad 2d pos'); } r.flashes++; return; }
         assertVec(p); r.draws++;
@@ -89,7 +95,11 @@ Server.prototype.connect = function (name) {
     const id = this.players.length + 1;
     const player = {
         networkId: id, name: name, dimension: 0, invulnerable: false, vehicle: null, health: 800,
-        position: new Vector3f(3400 + id * 10, 1050, 1300)
+        position: new Vector3f(3400 + id * 10, 1050, 1300),
+        GetBoneTransform: function (bone) {
+            const p = this.position;
+            return new Matrix([], new Vector3f(p.x, p.y + (bone === 0x661134AC || bone === 0xFF3E004B ? 0.07 : 1.0), p.z));
+        }
     };
     this.players.push(player);
     const client = new Client(this, player);
@@ -114,7 +124,8 @@ function Client(server, player) {
             rotation: new Vector3f(0, 0.5, 0), attachedToPlayer: true, fieldOfView: 1.0 },
         frozen: false,
         controlsEnabled: true,
-        lookAt: new Vector3f(0, 0, 0)
+        lookAt: new Vector3f(0, 0, 0),
+        GetBoneTransform: (bone, dtf) => player.GetBoneTransform(bone, dtf)
     };
     this.lp = lp;
     const jcmp = {
@@ -158,7 +169,16 @@ Client.prototype.ui = function (name, ...args) {
     fn(...args);
 };
 
+// Sticks held on a controller: the real UI re-sends them every tick.
+Client.prototype.hold = function (t, roll, pitch, yaw, arm, mode) {
+    this.held = [t, roll || 0, pitch || 0, yaw || 0, arm === undefined ? -2 : arm, mode === undefined ? -2 : mode, 'gamepad'];
+    this.ui('fpv/ui/sticks', ...this.held);
+};
+Client.prototype.release = function () { this.held = null; };
+Client.prototype.key = function (code, down) { this.ui('fpv/ui/key', code, down ? 1 : 0); };
+
 Client.prototype.frame = function () {
+    if (this.held) { this.uiHandlers['fpv/ui/sticks'](...this.held); }
     const r = makeRenderer();
     (this.events.GameUpdateRender || []).forEach((fn) => fn(r));
     (this.events.Render || []).forEach((fn) => fn(r));

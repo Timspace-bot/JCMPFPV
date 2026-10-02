@@ -9,7 +9,7 @@ const path = require('path');
 const ROOT = path.join(__dirname, '..');
 const SRC = path.join(ROOT, 'src', 'client');
 const OUT = path.join(ROOT, 'packages', 'fpvdrone', 'client_package', 'main.js');
-const ORDER = ['math.js', 'physics.js', 'world.js', 'swarm.js', 'remote.js', 'client.js'];
+const ORDER = ['math.js', 'physics.js', 'world.js', 'swarm.js', 'model.js', 'remote.js', 'client.js'];
 
 function build() {
     const parts = [
