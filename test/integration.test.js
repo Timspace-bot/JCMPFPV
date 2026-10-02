@@ -280,8 +280,17 @@ test('swarm attack with nothing in range reports it; full swarm refuses more cal
     assert.ok(/No targets/.test(a.lastUi('fpv/notify')[0]), a.lastUi('fpv/notify')[0]);
 });
 
-test('keyboard: hold W to take off, let go to hover, arrows fly forward', () => {
+test('defaults to true acro', () => {
     const { server, a } = setup({ defaults: true });
+    a.ui('fpv/ui/cmd', 'toggle');
+    server.run(0.2);
+    assert.strictEqual(osdOf(a).mode, 'acro');
+    assert.strictEqual(osdOf(a).altHold, false);
+});
+
+test('keyboard (angle + altitude assist): hold W to take off, let go to hover, arrows fly forward', () => {
+    const { server, a } = setup({ defaults: true });
+    a.ui('fpv/ui/settings', JSON.stringify({ mode: 'angle', altHold: true }));
     a.ui('fpv/ui/cmd', 'toggle');
     server.run(0.5);
     let o = osdOf(a);
@@ -308,6 +317,7 @@ test('keyboard: hold W to take off, let go to hover, arrows fly forward', () => 
 
 test('Rico stays where he launched and holds the radio; drone starts on the ground facing him', () => {
     const { server, a, b } = setup({ defaults: true });
+    a.ui('fpv/ui/settings', JSON.stringify({ mode: 'angle', altHold: true }));
     const start = { x: a.player.position.x, y: a.player.position.y, z: a.player.position.z };
     a.ui('fpv/ui/cmd', 'toggle');
     server.run(0.3);
@@ -342,4 +352,44 @@ test('the quad model is drawn with the textured 3D parts', () => {
     const tex = (n) => rb.byTexture['package://fpvdrone/textures/' + n + '.png'] || 0;
     assert.ok(tex('carbon_top') >= 5 && tex('motor_side') >= 16 && tex('prop_still') === 4 && tex('cam_front') === 1,
         JSON.stringify(rb.byTexture));
+});
+
+test('collision: with an aim ray that follows the camera, the drone cannot fly through a wall', () => {
+    const { server, a } = setup({ defaults: true });
+    a.ui('fpv/ui/settings', JSON.stringify({ mode: 'angle', altHold: true }));
+    a.ui('fpv/ui/cmd', 'toggle');
+    server.run(0.2);
+    // A wall 60 m in front of the drone (it starts facing Rico, so "forward"
+    // is back past him). The fake lookAt raycasts the camera against it.
+    const cam = a.lp.camera;
+    const osd0 = osdOf(a);
+    let wall = null;
+    Object.defineProperty(a.lp, 'lookAt', { get: () => {
+        const p = cam.position;
+        if (!wall) { return new Vector3f(0, 0, 0); }
+        // forward from the game euler (yawSign -1, pitchSign -1, order YXZ)
+        const yaw = -cam.rotation.y, pitch = -cam.rotation.x;
+        const f = { x: -Math.sin(yaw) * Math.cos(pitch), y: Math.sin(pitch), z: -Math.cos(yaw) * Math.cos(pitch) };
+        const t = (wall.d - (p.x * wall.n.x + p.z * wall.n.z)) / (f.x * wall.n.x + f.z * wall.n.z);
+        if (!(t > 0) || t > 500) { return new Vector3f(0, 0, 0); }
+        return new Vector3f(p.x + f.x * t, p.y + f.y * t, p.z + f.z * t);
+    } });
+    a.key(87, true);
+    server.run(2.5);
+    a.key(87, false);
+    // Wall plane perpendicular to the current heading, 60 m ahead.
+    const yaw = -cam.rotation.y;
+    const n = { x: -Math.sin(yaw), z: -Math.cos(yaw) };
+    const p = cam.position;
+    wall = { n: n, d: p.x * n.x + p.z * n.z + 60 };
+    a.key(38, true);
+    let crashed = false;
+    for (let i = 0; i < 100 && !crashed; i++) { server.run(0.1); crashed = osdOf(a).crashed; }
+    a.key(38, false);
+    const q = cam.position;
+    assert.ok(crashed, 'hit the wall');
+    assert.ok(q.x * n.x + q.z * n.z <= wall.d + 0.5, 'stopped at the wall, not behind it');
+    const d = osdOf(a).dbg;
+    assert.ok(d.probeRatio > 30 && d.solids > 0, JSON.stringify(d));
+    assert.deepStrictEqual(a.errors, []);
 });

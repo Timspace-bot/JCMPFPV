@@ -22,8 +22,8 @@ FPV.SWARM_DEFAULTS = {
     orbitMinHeight: 25,      // m above the attack point while circling
     orbitRadius: 35,
     orbitSpeed: 11,          // m/s tangential
-    cruiseSpeed: 45,         // m/s max transit speed
-    attackSpeed: 40,
+    cruiseSpeed: 60,         // m/s max transit speed
+    attackSpeed: 50,
     attackRadius: 150,       // targets are picked within this range of the leader
     hitRadius: 2.2,
     wreckSeconds: 15,

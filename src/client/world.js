@@ -22,9 +22,18 @@ FPV.World = function (seaLevel) {
     this.cellSize = 2.0;
     this.maxCells = 30000;
     this.searchCells = 2;     // floor lookups also consider samples up to 2 cells (~5 m) away
+    // Solid points: every surface the aim ray has hit (walls, trees, rocks,
+    // buildings, ground). The quad collides with them like a character does.
+    this.solids = {};         // "x:y:z" (1 m cells) -> [{x,y,z}, ...]
+    this.solidCount = 0;
+    this.maxSolids = 250000;
+    this.solidRadius = 0.35;  // each hit point acts as a small sphere
     this.probeValid = false;  // did the last lookAt sample line up with our camera?
     this.validSamples = 0;
     this.probeTries = 0;
+    this.lastOffDeg = -1;     // last lookAt's angle off our camera ray (diagnostics)
+    this.lastHitDist = -1;
+    this.recent = [];         // 1 = aligned, 0 = not, for the last ~2 s of frames
     this.lastSrc = 'sea';
 };
 
@@ -100,19 +109,96 @@ FPV.World.prototype.addGround = function (x, y, z) {
 
 FPV.World.prototype.sampleCount = function () { return this.cellCount; };
 
-// Validate a lookAt point against the camera ray. Returns the hit distance
-// along the ray, or -1 if the sample does not belong to our camera.
-FPV.World.prototype.probe = function (camPos, camFwd, hit) {
+FPV.World.prototype.solidKey = function (x, y, z) {
+    return Math.floor(x) + ':' + Math.floor(y) + ':' + Math.floor(z);
+};
+
+FPV.World.prototype.addSolid = function (p) {
+    const key = this.solidKey(p.x, p.y, p.z);
+    let list = this.solids[key];
+    if (!list) {
+        if (this.solidCount >= this.maxSolids) { this.solids = {}; this.solidCount = 0; }
+        list = this.solids[key] = [];
+    }
+    for (let i = 0; i < list.length; i++) {
+        const q = list[i];
+        const dx = q.x - p.x, dy = q.y - p.y, dz = q.z - p.z;
+        if (dx * dx + dy * dy + dz * dz < 0.04) { return; }   // already have one within 20 cm
+    }
+    if (list.length >= 8) { list.shift(); this.solidCount--; }
+    list.push({ x: p.x, y: p.y, z: p.z });
+    this.solidCount++;
+};
+
+// Deepest contact between a sphere (pos, r) and the known solid points, as
+// {normal, depth}, or null. Like a character capsule: push out along the
+// normal, the caller decides between sliding/bouncing and crashing.
+FPV.World.prototype.collide = function (pos, r) {
+    const reach = r + this.solidRadius;
+    const bx = Math.floor(pos.x), by = Math.floor(pos.y), bz = Math.floor(pos.z);
+    let best = null;
+    for (let ix = -1; ix <= 1; ix++) {
+        for (let iy = -1; iy <= 1; iy++) {
+            for (let iz = -1; iz <= 1; iz++) {
+                const list = this.solids[(bx + ix) + ':' + (by + iy) + ':' + (bz + iz)];
+                if (!list) { continue; }
+                for (let i = 0; i < list.length; i++) {
+                    const q = list[i];
+                    const dx = pos.x - q.x, dy = pos.y - q.y, dz = pos.z - q.z;
+                    const d2 = dx * dx + dy * dy + dz * dz;
+                    if (d2 >= reach * reach) { continue; }
+                    const d = Math.sqrt(d2);
+                    const depth = reach - d;
+                    if (!best || depth > best.depth) {
+                        best = { depth: depth, normal: d > 1e-6 ? { x: dx / d, y: dy / d, z: dz / d } : { x: 0, y: 1, z: 0 } };
+                    }
+                }
+            }
+        }
+    }
+    return best;
+};
+
+// Share of recent frames where the aim ray lined up with our camera.
+FPV.World.prototype.probeRatio = function () {
+    if (!this.recent.length) { return 0; }
+    let n = 0;
+    for (let i = 0; i < this.recent.length; i++) { n += this.recent[i]; }
+    return n / this.recent.length;
+};
+
+// Feed one lookAt point. `cams` are the camera poses we set over the last few
+// frames ({pos, fwd}); the game may answer with a frame or two of lag. If the
+// point lines up with one of them, the aim ray follows our camera and it is a
+// real surface hit: it becomes a floor sample and a solid point. Returns the
+// hit distance along the matching ray, or -1.
+FPV.World.prototype.probe = function (cams, hit) {
     this.probeValid = false;
     this.probeTries++;
-    if (!hit || !FPV.isFiniteVec(hit)) { return -1; }
-    const d = FPV.sub(hit, camPos);
-    const dist = FPV.len(d);
-    if (dist < 0.05 || dist > 1500) { return -1; }
-    const cos = FPV.dot(FPV.scale(d, 1 / dist), camFwd);
-    if (cos < 0.9994) { return -1; }   // > ~2 degrees off our view ray
-    if (Math.abs(hit.y - this.seaLevel) > 0.05) { this.addSample(hit); }
+    let aligned = 0;
+    let bestCos = -2, bestDist = -1;
+    if (hit && FPV.isFiniteVec(hit) && !(hit.x === 0 && hit.y === 0 && hit.z === 0)) {
+        for (let i = 0; i < cams.length; i++) {
+            const d = FPV.sub(hit, cams[i].pos);
+            const dist = FPV.len(d);
+            if (dist < 0.05) { continue; }
+            const cos = FPV.dot(FPV.scale(d, 1 / dist), cams[i].fwd);
+            if (cos > bestCos) { bestCos = cos; bestDist = dist; }
+        }
+        if (bestCos > -2) {
+            this.lastOffDeg = Math.acos(FPV.clamp(bestCos, -1, 1)) / FPV.DEG;
+            this.lastHitDist = bestDist;
+            aligned = bestCos >= 0.9986 && bestDist < 1200 ? 1 : 0;   // within ~3 degrees
+        }
+    }
+    this.recent.push(aligned);
+    if (this.recent.length > 120) { this.recent.shift(); }
+    if (!aligned) { return -1; }
+    if (Math.abs(hit.y - this.seaLevel) > 0.05) {
+        this.addSample(hit);
+        this.addSolid(hit);
+    }
     this.probeValid = true;
     this.validSamples++;
-    return dist;
+    return bestDist;
 };

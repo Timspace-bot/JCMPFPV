@@ -254,12 +254,12 @@ FPV.horiz = function (v) { return { x: v.x, y: 0, z: v.z }; };
 FPV.DEFAULT_TUNE = {
     massKg: 0.65,
     gravity: 9.81,
-    thrustToWeight: 7.0,
+    thrustToWeight: 10.0,    // punchy: Medici is big
     motorTau: 0.03,          // s, motor/prop spool time constant
     rateTau: 0.022,          // s, how quickly the PID loop reaches the commanded rate
-    idleThrottle: 0.045,     // airmode idle - thrust fraction while armed at zero throttle
+    idleThrottle: 0.10,      // airmode idle - motor (rpm) fraction while armed at zero throttle
     dragLinear: 0.015,       // N per m/s
-    dragBody: { x: 0.014, y: 0.045, z: 0.010 }, // quadratic, N per (m/s)^2, body axes
+    dragBody: { x: 0.008, y: 0.040, z: 0.0058 }, // quadratic, N per (m/s)^2, body axes
     rates: {
         roll: { rcRate: 1.0, superRate: 0.70, expo: 0.0 },
         pitch: { rcRate: 1.0, superRate: 0.70, expo: 0.0 },
@@ -276,7 +276,7 @@ FPV.DEFAULT_TUNE = {
     collisionRadius: 0.15,
     crashSpeed: 8.0,         // m/s impact speed that breaks the quad
     groundFriction: 6.0,
-    battery: { enabled: true, cells: 4, capacityMah: 1500, maxCurrentA: 120 }
+    battery: { enabled: true, cells: 6, capacityMah: 2200, maxCurrentA: 150 }
 };
 
 FPV.cloneTune = function (t) { return JSON.parse(JSON.stringify(t)); };
@@ -382,7 +382,9 @@ FPV.desiredRates = function (s, input, tune) {
 
 FPV.motorCommand = function (s, input, tune) {
     if (!s.armed || s.crashed) { return 0; }
-    if (input.mode === 'direct') { return FPV.clamp(input.thrustCmd, tune.idleThrottle, 1); }
+    // s.motor is a motor speed fraction; props make thrust ~ speed^2, so
+    // thrust targets (autopilot, altitude assist) go through a square root.
+    if (input.mode === 'direct') { return FPV.clamp(Math.sqrt(Math.max(input.thrustCmd, 0)), tune.idleThrottle, 1); }
     const thrust = FPV.throttleCurve(input.throttle, tune.throttleMid, tune.throttleExpo);
     if (input.altHold && input.mode !== 'acro') {
         // Throttle stick commands a climb rate; centre stick = hover.
@@ -391,7 +393,7 @@ FPV.motorCommand = function (s, input, tune) {
         const vzTarget = (FPV.clamp(input.throttle, 0, 1) - 0.5) * 2 * tune.altHoldMaxClimb;
         const accel = tune.gravity + tune.altHoldGain * (vzTarget - s.vel.y);
         const maxAccel = tune.thrustToWeight * tune.gravity;
-        return FPV.clamp(accel / (maxAccel * tiltCos), tune.idleThrottle, 1);
+        return FPV.clamp(Math.sqrt(Math.max(accel / (maxAccel * tiltCos), 0)), tune.idleThrottle, 1);
     }
     return tune.idleThrottle + (1 - tune.idleThrottle) * thrust;
 };
@@ -399,7 +401,7 @@ FPV.motorCommand = function (s, input, tune) {
 FPV.updateBattery = function (s, tune, dt) {
     const b = tune.battery;
     if (!b.enabled) { s.cellVoltage = 4.2; s.currentA = 0; return 1; }
-    s.currentA = 0.8 + b.maxCurrentA * Math.pow(s.motor, 1.5);
+    s.currentA = 0.8 + b.maxCurrentA * s.motor * s.motor * s.motor;   // power ~ rpm^3
     s.usedMah += s.currentA * dt / 3.6;
     const charge = FPV.clamp(1 - s.usedMah / b.capacityMah, 0, 1);
     // Rough LiPo curve: 4.2V full, plateau ~3.8V, knee below 3.5V.
@@ -454,7 +456,7 @@ FPV.step = function (s, input, env, tune, dt) {
     // --- forces -------------------------------------------------------------
     const maxThrust = tune.thrustToWeight * m * g;
     const up = FPV.qRotate(s.q, { x: 0, y: 1, z: 0 });
-    let force = FPV.scale(up, s.motor * maxThrust * battFactor);
+    let force = FPV.scale(up, s.motor * s.motor * maxThrust * battFactor);
     force.y -= m * g;
 
     force = FPV.add(force, FPV.dragForce(s.q, s.vel, tune));
@@ -494,6 +496,24 @@ FPV.step = function (s, input, env, tune, dt) {
         s.onGround = true;
     } else {
         s.onGround = false;
+    }
+
+    // --- everything else the world knows is solid (walls, trees, rocks) -----
+    if (env.collide) {
+        const c = env.collide(s.pos, r);
+        if (c) {
+            s.pos = FPV.add(s.pos, FPV.scale(c.normal, c.depth));
+            const vn = FPV.dot(s.vel, c.normal);
+            if (vn < 0) {
+                if (-vn > tune.crashSpeed && !s.crashed) {
+                    FPV.crash(s, 'IMPACT');
+                    s.events[s.events.length - 1].speed = -vn;
+                }
+                // Remove the inward part (with a little bounce), scrub some slide.
+                s.vel = FPV.scale(FPV.sub(s.vel, FPV.scale(c.normal, vn * 1.3)), 0.92);
+            }
+            if (c.normal.y > 0.7) { s.onGround = true; }
+        }
     }
 
     if (s.armed) { s.flightTime += dt; }
@@ -555,9 +575,18 @@ FPV.World = function (seaLevel) {
     this.cellSize = 2.0;
     this.maxCells = 30000;
     this.searchCells = 2;     // floor lookups also consider samples up to 2 cells (~5 m) away
+    // Solid points: every surface the aim ray has hit (walls, trees, rocks,
+    // buildings, ground). The quad collides with them like a character does.
+    this.solids = {};         // "x:y:z" (1 m cells) -> [{x,y,z}, ...]
+    this.solidCount = 0;
+    this.maxSolids = 250000;
+    this.solidRadius = 0.35;  // each hit point acts as a small sphere
     this.probeValid = false;  // did the last lookAt sample line up with our camera?
     this.validSamples = 0;
     this.probeTries = 0;
+    this.lastOffDeg = -1;     // last lookAt's angle off our camera ray (diagnostics)
+    this.lastHitDist = -1;
+    this.recent = [];         // 1 = aligned, 0 = not, for the last ~2 s of frames
     this.lastSrc = 'sea';
 };
 
@@ -633,21 +662,98 @@ FPV.World.prototype.addGround = function (x, y, z) {
 
 FPV.World.prototype.sampleCount = function () { return this.cellCount; };
 
-// Validate a lookAt point against the camera ray. Returns the hit distance
-// along the ray, or -1 if the sample does not belong to our camera.
-FPV.World.prototype.probe = function (camPos, camFwd, hit) {
+FPV.World.prototype.solidKey = function (x, y, z) {
+    return Math.floor(x) + ':' + Math.floor(y) + ':' + Math.floor(z);
+};
+
+FPV.World.prototype.addSolid = function (p) {
+    const key = this.solidKey(p.x, p.y, p.z);
+    let list = this.solids[key];
+    if (!list) {
+        if (this.solidCount >= this.maxSolids) { this.solids = {}; this.solidCount = 0; }
+        list = this.solids[key] = [];
+    }
+    for (let i = 0; i < list.length; i++) {
+        const q = list[i];
+        const dx = q.x - p.x, dy = q.y - p.y, dz = q.z - p.z;
+        if (dx * dx + dy * dy + dz * dz < 0.04) { return; }   // already have one within 20 cm
+    }
+    if (list.length >= 8) { list.shift(); this.solidCount--; }
+    list.push({ x: p.x, y: p.y, z: p.z });
+    this.solidCount++;
+};
+
+// Deepest contact between a sphere (pos, r) and the known solid points, as
+// {normal, depth}, or null. Like a character capsule: push out along the
+// normal, the caller decides between sliding/bouncing and crashing.
+FPV.World.prototype.collide = function (pos, r) {
+    const reach = r + this.solidRadius;
+    const bx = Math.floor(pos.x), by = Math.floor(pos.y), bz = Math.floor(pos.z);
+    let best = null;
+    for (let ix = -1; ix <= 1; ix++) {
+        for (let iy = -1; iy <= 1; iy++) {
+            for (let iz = -1; iz <= 1; iz++) {
+                const list = this.solids[(bx + ix) + ':' + (by + iy) + ':' + (bz + iz)];
+                if (!list) { continue; }
+                for (let i = 0; i < list.length; i++) {
+                    const q = list[i];
+                    const dx = pos.x - q.x, dy = pos.y - q.y, dz = pos.z - q.z;
+                    const d2 = dx * dx + dy * dy + dz * dz;
+                    if (d2 >= reach * reach) { continue; }
+                    const d = Math.sqrt(d2);
+                    const depth = reach - d;
+                    if (!best || depth > best.depth) {
+                        best = { depth: depth, normal: d > 1e-6 ? { x: dx / d, y: dy / d, z: dz / d } : { x: 0, y: 1, z: 0 } };
+                    }
+                }
+            }
+        }
+    }
+    return best;
+};
+
+// Share of recent frames where the aim ray lined up with our camera.
+FPV.World.prototype.probeRatio = function () {
+    if (!this.recent.length) { return 0; }
+    let n = 0;
+    for (let i = 0; i < this.recent.length; i++) { n += this.recent[i]; }
+    return n / this.recent.length;
+};
+
+// Feed one lookAt point. `cams` are the camera poses we set over the last few
+// frames ({pos, fwd}); the game may answer with a frame or two of lag. If the
+// point lines up with one of them, the aim ray follows our camera and it is a
+// real surface hit: it becomes a floor sample and a solid point. Returns the
+// hit distance along the matching ray, or -1.
+FPV.World.prototype.probe = function (cams, hit) {
     this.probeValid = false;
     this.probeTries++;
-    if (!hit || !FPV.isFiniteVec(hit)) { return -1; }
-    const d = FPV.sub(hit, camPos);
-    const dist = FPV.len(d);
-    if (dist < 0.05 || dist > 1500) { return -1; }
-    const cos = FPV.dot(FPV.scale(d, 1 / dist), camFwd);
-    if (cos < 0.9994) { return -1; }   // > ~2 degrees off our view ray
-    if (Math.abs(hit.y - this.seaLevel) > 0.05) { this.addSample(hit); }
+    let aligned = 0;
+    let bestCos = -2, bestDist = -1;
+    if (hit && FPV.isFiniteVec(hit) && !(hit.x === 0 && hit.y === 0 && hit.z === 0)) {
+        for (let i = 0; i < cams.length; i++) {
+            const d = FPV.sub(hit, cams[i].pos);
+            const dist = FPV.len(d);
+            if (dist < 0.05) { continue; }
+            const cos = FPV.dot(FPV.scale(d, 1 / dist), cams[i].fwd);
+            if (cos > bestCos) { bestCos = cos; bestDist = dist; }
+        }
+        if (bestCos > -2) {
+            this.lastOffDeg = Math.acos(FPV.clamp(bestCos, -1, 1)) / FPV.DEG;
+            this.lastHitDist = bestDist;
+            aligned = bestCos >= 0.9986 && bestDist < 1200 ? 1 : 0;   // within ~3 degrees
+        }
+    }
+    this.recent.push(aligned);
+    if (this.recent.length > 120) { this.recent.shift(); }
+    if (!aligned) { return -1; }
+    if (Math.abs(hit.y - this.seaLevel) > 0.05) {
+        this.addSample(hit);
+        this.addSolid(hit);
+    }
     this.probeValid = true;
     this.validSamples++;
-    return dist;
+    return bestDist;
 };
 
 // ===== swarm.js =====
@@ -675,8 +781,8 @@ FPV.SWARM_DEFAULTS = {
     orbitMinHeight: 25,      // m above the attack point while circling
     orbitRadius: 35,
     orbitSpeed: 11,          // m/s tangential
-    cruiseSpeed: 45,         // m/s max transit speed
-    attackSpeed: 40,
+    cruiseSpeed: 60,         // m/s max transit speed
+    attackSpeed: 50,
     attackRadius: 150,       // targets are picked within this range of the leader
     hitRadius: 2.2,
     wreckSeconds: 15,
@@ -1388,10 +1494,11 @@ const cfg = {
 const settings = {
     tune: FPV.cloneTune(FPV.DEFAULT_TUNE),
     camera: { eulerOrder: 'YXZ', pitchSign: -1, yawSign: -1, rollSign: -1, fovDeg: 92, modelRotSign: 1 },
-    mode: 'angle',
-    altHold: true,
+    mode: 'acro',
+    altHold: false,
     view: 'fpv',
-    kbStrength: 0.6
+    kbStrength: 0.6,
+    keepControls: false   // experiment: leave game controls on while flying
 };
 
 let tune = FPV.cloneTune(FPV.DEFAULT_TUNE);
@@ -1411,7 +1518,8 @@ let lastControlsAssert = 0;
 let savedFov = null;
 let chatOpen = false;
 let menuOpen = false;
-let prevCam = null;             // camera pose we set last frame (for lookAt validation)
+let prevCam = null;             // camera pose we set last frame
+const camRing = [];             // last few camera poses {pos, fwd} for lookAt matching
 let chaseYaw = 0;
 let videoGlitchUntil = 0;
 let armSwitchPrev = null;
@@ -1421,7 +1529,7 @@ let banner = null;              // {text, until} short OSD banner
 const effects = [];             // impact flashes [{pos, t0}]
 const targetTracks = {};        // key -> {pos, t} for velocity estimates
 
-const input = { throttle: 0, roll: 0, pitch: 0, yaw: 0, mode: 'angle', altHold: true, source: 'keyboard' };
+const input = { throttle: 0, roll: 0, pitch: 0, yaw: 0, mode: 'acro', altHold: false, source: 'keyboard' };
 
 // Keyboard flying is integrated here, per game frame, from raw key events the
 // UI forwards (UI timers can be throttled by CEF; key events are not).
@@ -1628,7 +1736,7 @@ function begin() {
 
     savedFov = lp.camera.fieldOfView;
     lp.frozen = true;
-    lp.controlsEnabled = false;
+    lp.controlsEnabled = !!settings.keepControls;
     lp.camera.attachedToPlayer = false;
     lp.camera.fieldOfView = settings.camera.fovDeg * FPV.DEG;
     if (typeof jcmp.ui.HideHud === 'function') { jcmp.ui.HideHud(); }
@@ -1637,6 +1745,7 @@ function begin() {
     lastFrame = Date.now();
     acc = 0;
     prevCam = null;
+    camRing.length = 0;
     chaseYaw = FPV.yawOf(heading);
     armSwitchPrev = null;
     armBlockedReason = '';
@@ -1898,9 +2007,8 @@ function probeTerrain(dt) {
     if (!prevCam) { return; }
     let hit = null;
     try { hit = jcmp.localPlayer.lookAt; } catch (e) { hit = null; }
-    if (!hit) { return; }
+    const dist = world.probe(camRing, hit ? fromVec3f(hit) : null);
     const camFwd = FPV.qRotate(prevCam.q, { x: 0, y: 0, z: -1 });
-    const dist = world.probe(prevCam.pos, camFwd, fromVec3f(hit));
     if (dist < 0 || settings.view !== 'fpv' || drone.crashed || handover) { return; }
 
     // Head-on obstacle check along the camera ray.
@@ -2000,6 +2108,11 @@ function sendOsd(now) {
         dbg: {
             probeOk: world.validSamples,
             probeTries: world.probeTries,
+            probeRatio: Math.round(world.probeRatio() * 100),
+            probeOff: Math.round(world.lastOffDeg * 10) / 10,
+            probeDist: Math.round(world.lastHitDist * 10) / 10,
+            solids: world.solidCount,
+            keepControls: !!settings.keepControls,
             samples: world.sampleCount(),
             floor: Math.round((world.floorAt(s.pos).y - launch.y) * 10) / 10,
             floorSrc: world.lastSrc,
@@ -2096,10 +2209,12 @@ function frame(r) {
     const cam = cameraFor(settings.view, dt);
     applyCamera(cam);
     prevCam = cam;
+    camRing.unshift({ pos: cam.pos, fwd: FPV.qRotate(cam.q, { x: 0, y: 0, z: -1 }) });
+    if (camRing.length > 3) { camRing.pop(); }
 
     if (now - lastControlsAssert > 500) {
         lastControlsAssert = now;
-        jcmp.localPlayer.controlsEnabled = false;
+        jcmp.localPlayer.controlsEnabled = !!settings.keepControls && !chatOpen;
     }
 
     sendState(now);
@@ -2203,6 +2318,7 @@ jcmp.ui.AddEvent('fpv/ui/settings', (json) => {
     if (MODES.indexOf(s.mode) >= 0) { settings.mode = s.mode; }
     if (typeof s.altHold === 'boolean') { settings.altHold = s.altHold; }
     if (isFinite(s.kbStrength)) { settings.kbStrength = FPV.clamp(+s.kbStrength, 0.1, 1); }
+    if (typeof s.keepControls === 'boolean') { settings.keepControls = s.keepControls; }
     if (VIEWS.indexOf(s.view) >= 0) { settings.view = s.view; }
     rebuildTune();
     if (status === 'flying') { jcmp.localPlayer.camera.fieldOfView = settings.camera.fovDeg * FPV.DEG; }

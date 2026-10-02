@@ -28,10 +28,11 @@ const cfg = {
 const settings = {
     tune: FPV.cloneTune(FPV.DEFAULT_TUNE),
     camera: { eulerOrder: 'YXZ', pitchSign: -1, yawSign: -1, rollSign: -1, fovDeg: 92, modelRotSign: 1 },
-    mode: 'angle',
-    altHold: true,
+    mode: 'acro',
+    altHold: false,
     view: 'fpv',
-    kbStrength: 0.6
+    kbStrength: 0.6,
+    keepControls: false   // experiment: leave game controls on while flying
 };
 
 let tune = FPV.cloneTune(FPV.DEFAULT_TUNE);
@@ -51,7 +52,8 @@ let lastControlsAssert = 0;
 let savedFov = null;
 let chatOpen = false;
 let menuOpen = false;
-let prevCam = null;             // camera pose we set last frame (for lookAt validation)
+let prevCam = null;             // camera pose we set last frame
+const camRing = [];             // last few camera poses {pos, fwd} for lookAt matching
 let chaseYaw = 0;
 let videoGlitchUntil = 0;
 let armSwitchPrev = null;
@@ -61,7 +63,7 @@ let banner = null;              // {text, until} short OSD banner
 const effects = [];             // impact flashes [{pos, t0}]
 const targetTracks = {};        // key -> {pos, t} for velocity estimates
 
-const input = { throttle: 0, roll: 0, pitch: 0, yaw: 0, mode: 'angle', altHold: true, source: 'keyboard' };
+const input = { throttle: 0, roll: 0, pitch: 0, yaw: 0, mode: 'acro', altHold: false, source: 'keyboard' };
 
 // Keyboard flying is integrated here, per game frame, from raw key events the
 // UI forwards (UI timers can be throttled by CEF; key events are not).
@@ -268,7 +270,7 @@ function begin() {
 
     savedFov = lp.camera.fieldOfView;
     lp.frozen = true;
-    lp.controlsEnabled = false;
+    lp.controlsEnabled = !!settings.keepControls;
     lp.camera.attachedToPlayer = false;
     lp.camera.fieldOfView = settings.camera.fovDeg * FPV.DEG;
     if (typeof jcmp.ui.HideHud === 'function') { jcmp.ui.HideHud(); }
@@ -277,6 +279,7 @@ function begin() {
     lastFrame = Date.now();
     acc = 0;
     prevCam = null;
+    camRing.length = 0;
     chaseYaw = FPV.yawOf(heading);
     armSwitchPrev = null;
     armBlockedReason = '';
@@ -538,9 +541,8 @@ function probeTerrain(dt) {
     if (!prevCam) { return; }
     let hit = null;
     try { hit = jcmp.localPlayer.lookAt; } catch (e) { hit = null; }
-    if (!hit) { return; }
+    const dist = world.probe(camRing, hit ? fromVec3f(hit) : null);
     const camFwd = FPV.qRotate(prevCam.q, { x: 0, y: 0, z: -1 });
-    const dist = world.probe(prevCam.pos, camFwd, fromVec3f(hit));
     if (dist < 0 || settings.view !== 'fpv' || drone.crashed || handover) { return; }
 
     // Head-on obstacle check along the camera ray.
@@ -640,6 +642,11 @@ function sendOsd(now) {
         dbg: {
             probeOk: world.validSamples,
             probeTries: world.probeTries,
+            probeRatio: Math.round(world.probeRatio() * 100),
+            probeOff: Math.round(world.lastOffDeg * 10) / 10,
+            probeDist: Math.round(world.lastHitDist * 10) / 10,
+            solids: world.solidCount,
+            keepControls: !!settings.keepControls,
             samples: world.sampleCount(),
             floor: Math.round((world.floorAt(s.pos).y - launch.y) * 10) / 10,
             floorSrc: world.lastSrc,
@@ -736,10 +743,12 @@ function frame(r) {
     const cam = cameraFor(settings.view, dt);
     applyCamera(cam);
     prevCam = cam;
+    camRing.unshift({ pos: cam.pos, fwd: FPV.qRotate(cam.q, { x: 0, y: 0, z: -1 }) });
+    if (camRing.length > 3) { camRing.pop(); }
 
     if (now - lastControlsAssert > 500) {
         lastControlsAssert = now;
-        jcmp.localPlayer.controlsEnabled = false;
+        jcmp.localPlayer.controlsEnabled = !!settings.keepControls && !chatOpen;
     }
 
     sendState(now);
@@ -843,6 +852,7 @@ jcmp.ui.AddEvent('fpv/ui/settings', (json) => {
     if (MODES.indexOf(s.mode) >= 0) { settings.mode = s.mode; }
     if (typeof s.altHold === 'boolean') { settings.altHold = s.altHold; }
     if (isFinite(s.kbStrength)) { settings.kbStrength = FPV.clamp(+s.kbStrength, 0.1, 1); }
+    if (typeof s.keepControls === 'boolean') { settings.keepControls = s.keepControls; }
     if (VIEWS.indexOf(s.view) >= 0) { settings.view = s.view; }
     rebuildTune();
     if (status === 'flying') { jcmp.localPlayer.camera.fieldOfView = settings.camera.fovDeg * FPV.DEG; }

@@ -74,11 +74,13 @@ test('armed quad climbs at full throttle and hovers near the hover point', () =>
     sim(s, { throttle: 1, roll: 0, pitch: 0, yaw: 0, mode: 'acro' }, flat, tune, 1);
     assert.ok(s.pos.y > 1010, 'climbed ' + s.pos.y);
 
-    // hover throttle = (1/twr - idle) / (1 - idle)
-    const hover = (1 / tune.thrustToWeight - tune.idleThrottle) / (1 - tune.idleThrottle);
+    // thrust ~ motor^2, so hover motor = sqrt(1/twr); throttle = (motor - idle) / (1 - idle)
+    const hoverMotor = Math.sqrt(1 / tune.thrustToWeight);
+    const hover = (hoverMotor - tune.idleThrottle) / (1 - tune.idleThrottle);
+    assert.ok(hover > 0.2 && hover < 0.4, 'hover throttle is in a usable range: ' + hover);
     const h = FPV.createState({ x: 0, y: 1100, z: 0 });
     h.armed = true;
-    h.motor = 1 / tune.thrustToWeight;
+    h.motor = hoverMotor;
     sim(h, { throttle: hover, roll: 0, pitch: 0, yaw: 0, mode: 'acro' }, flat, tune, 3);
     close(h.vel.y, 0, 0.05, 'hover vertical speed');
 });
@@ -126,7 +128,7 @@ test('forward flight reaches a sane top speed', () => {
     s.armed = true;
     sim(s, { throttle: 1, roll: 0, pitch: 0, yaw: 0, mode: 'acro' }, flat, tune, 8);
     const kmh = FPV.len(s.vel) * 3.6;
-    assert.ok(kmh > 120 && kmh < 220, 'top speed ' + kmh.toFixed(1) + ' km/h');
+    assert.ok(kmh > 170 && kmh < 260, 'top speed ' + kmh.toFixed(1) + ' km/h');
 });
 
 test('hard impact crashes and disarms; water is fatal', () => {
@@ -177,4 +179,31 @@ test('camera pose applies uptilt', () => {
     const cam = FPV.cameraPose(s, tune);
     const fwd = FPV.qRotate(cam.q, { x: 0, y: 0, z: -1 });
     close(Math.asin(fwd.y), tune.cameraTiltDeg * FPV.DEG, 1e-9, 'uptilt');
+});
+
+test('true acro: centred sticks hold the current attitude (no self-levelling)', () => {
+    const tune = FPV.cloneTune(FPV.DEFAULT_TUNE);
+    const s = FPV.createState({ x: 0, y: 2000, z: 0 }, FPV.qAxisAngle({ x: 0, y: 0, z: 1 }, 0.8));
+    s.armed = true;
+    sim(s, { throttle: 0.3, roll: 0, pitch: 0, yaw: 0, mode: 'acro' }, flat, tune, 2);
+    const right = FPV.qRotate(s.q, { x: 1, y: 0, z: 0 });
+    close(Math.asin(right.y), 0.8, 0.01, 'still banked');
+});
+
+test('solid points: slow contact slides, fast contact crashes', () => {
+    const tune = FPV.cloneTune(FPV.DEFAULT_TUNE);
+    const wall = { floorAt: () => ({ y: 1000, water: false }),
+        collide: (p, r) => (p.x + r > 10 ? { normal: { x: -1, y: 0, z: 0 }, depth: p.x + r - 10 } : null) };
+    const slow = FPV.createState({ x: 8, y: 1050, z: 0 });
+    slow.armed = true; slow.motor = Math.sqrt(1 / tune.thrustToWeight);
+    slow.vel = { x: 4, y: 0, z: 0 };
+    sim(slow, { throttle: 0.27, roll: 0, pitch: 0, yaw: 0, mode: 'acro' }, wall, tune, 1.5);
+    assert.strictEqual(slow.crashed, false, 'bumped, not broken');
+    assert.ok(slow.pos.x <= 10, 'did not pass through: ' + slow.pos.x);
+    const fast = FPV.createState({ x: 0, y: 1050, z: 0 });
+    fast.armed = true;
+    fast.vel = { x: 30, y: 0, z: 0 };
+    sim(fast, { throttle: 0.3, roll: 0, pitch: 0, yaw: 0, mode: 'acro' }, wall, tune, 1);
+    assert.strictEqual(fast.crashReason, 'IMPACT');
+    assert.ok(fast.pos.x <= 10, 'stopped at the wall: ' + fast.pos.x);
 });

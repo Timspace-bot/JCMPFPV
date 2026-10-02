@@ -47,8 +47,8 @@ module.exports = {
         orbitRadius: 35,
         orbitSpeed: 11,
         formationMinHeight: 4,
-        cruiseSpeed: 45,
-        attackSpeed: 40,
+        cruiseSpeed: 60,
+        attackSpeed: 50,
         attackRadius: 150,      // swarm-attack picks targets within this range of the pilot's drone
         wreckSeconds: 15
     },

@@ -9,12 +9,12 @@
 FPV.DEFAULT_TUNE = {
     massKg: 0.65,
     gravity: 9.81,
-    thrustToWeight: 7.0,
+    thrustToWeight: 10.0,    // punchy: Medici is big
     motorTau: 0.03,          // s, motor/prop spool time constant
     rateTau: 0.022,          // s, how quickly the PID loop reaches the commanded rate
-    idleThrottle: 0.045,     // airmode idle - thrust fraction while armed at zero throttle
+    idleThrottle: 0.10,      // airmode idle - motor (rpm) fraction while armed at zero throttle
     dragLinear: 0.015,       // N per m/s
-    dragBody: { x: 0.014, y: 0.045, z: 0.010 }, // quadratic, N per (m/s)^2, body axes
+    dragBody: { x: 0.008, y: 0.040, z: 0.0058 }, // quadratic, N per (m/s)^2, body axes
     rates: {
         roll: { rcRate: 1.0, superRate: 0.70, expo: 0.0 },
         pitch: { rcRate: 1.0, superRate: 0.70, expo: 0.0 },
@@ -31,7 +31,7 @@ FPV.DEFAULT_TUNE = {
     collisionRadius: 0.15,
     crashSpeed: 8.0,         // m/s impact speed that breaks the quad
     groundFriction: 6.0,
-    battery: { enabled: true, cells: 4, capacityMah: 1500, maxCurrentA: 120 }
+    battery: { enabled: true, cells: 6, capacityMah: 2200, maxCurrentA: 150 }
 };
 
 FPV.cloneTune = function (t) { return JSON.parse(JSON.stringify(t)); };
@@ -137,7 +137,9 @@ FPV.desiredRates = function (s, input, tune) {
 
 FPV.motorCommand = function (s, input, tune) {
     if (!s.armed || s.crashed) { return 0; }
-    if (input.mode === 'direct') { return FPV.clamp(input.thrustCmd, tune.idleThrottle, 1); }
+    // s.motor is a motor speed fraction; props make thrust ~ speed^2, so
+    // thrust targets (autopilot, altitude assist) go through a square root.
+    if (input.mode === 'direct') { return FPV.clamp(Math.sqrt(Math.max(input.thrustCmd, 0)), tune.idleThrottle, 1); }
     const thrust = FPV.throttleCurve(input.throttle, tune.throttleMid, tune.throttleExpo);
     if (input.altHold && input.mode !== 'acro') {
         // Throttle stick commands a climb rate; centre stick = hover.
@@ -146,7 +148,7 @@ FPV.motorCommand = function (s, input, tune) {
         const vzTarget = (FPV.clamp(input.throttle, 0, 1) - 0.5) * 2 * tune.altHoldMaxClimb;
         const accel = tune.gravity + tune.altHoldGain * (vzTarget - s.vel.y);
         const maxAccel = tune.thrustToWeight * tune.gravity;
-        return FPV.clamp(accel / (maxAccel * tiltCos), tune.idleThrottle, 1);
+        return FPV.clamp(Math.sqrt(Math.max(accel / (maxAccel * tiltCos), 0)), tune.idleThrottle, 1);
     }
     return tune.idleThrottle + (1 - tune.idleThrottle) * thrust;
 };
@@ -154,7 +156,7 @@ FPV.motorCommand = function (s, input, tune) {
 FPV.updateBattery = function (s, tune, dt) {
     const b = tune.battery;
     if (!b.enabled) { s.cellVoltage = 4.2; s.currentA = 0; return 1; }
-    s.currentA = 0.8 + b.maxCurrentA * Math.pow(s.motor, 1.5);
+    s.currentA = 0.8 + b.maxCurrentA * s.motor * s.motor * s.motor;   // power ~ rpm^3
     s.usedMah += s.currentA * dt / 3.6;
     const charge = FPV.clamp(1 - s.usedMah / b.capacityMah, 0, 1);
     // Rough LiPo curve: 4.2V full, plateau ~3.8V, knee below 3.5V.
@@ -209,7 +211,7 @@ FPV.step = function (s, input, env, tune, dt) {
     // --- forces -------------------------------------------------------------
     const maxThrust = tune.thrustToWeight * m * g;
     const up = FPV.qRotate(s.q, { x: 0, y: 1, z: 0 });
-    let force = FPV.scale(up, s.motor * maxThrust * battFactor);
+    let force = FPV.scale(up, s.motor * s.motor * maxThrust * battFactor);
     force.y -= m * g;
 
     force = FPV.add(force, FPV.dragForce(s.q, s.vel, tune));
@@ -249,6 +251,24 @@ FPV.step = function (s, input, env, tune, dt) {
         s.onGround = true;
     } else {
         s.onGround = false;
+    }
+
+    // --- everything else the world knows is solid (walls, trees, rocks) -----
+    if (env.collide) {
+        const c = env.collide(s.pos, r);
+        if (c) {
+            s.pos = FPV.add(s.pos, FPV.scale(c.normal, c.depth));
+            const vn = FPV.dot(s.vel, c.normal);
+            if (vn < 0) {
+                if (-vn > tune.crashSpeed && !s.crashed) {
+                    FPV.crash(s, 'IMPACT');
+                    s.events[s.events.length - 1].speed = -vn;
+                }
+                // Remove the inward part (with a little bounce), scrub some slide.
+                s.vel = FPV.scale(FPV.sub(s.vel, FPV.scale(c.normal, vn * 1.3)), 0.92);
+            }
+            if (c.normal.y > 0.7) { s.onGround = true; }
+        }
     }
 
     if (s.armed) { s.flightTime += dt; }

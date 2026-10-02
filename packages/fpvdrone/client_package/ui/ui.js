@@ -10,8 +10,8 @@
     };
 
     const DEG = Math.PI / 180;
-    const STORAGE_KEY = 'fpvdrone.settings.v2';
-    const OLD_STORAGE_KEY = 'fpvdrone.settings.v1';
+    const STORAGE_KEY = 'fpvdrone.settings.v3';
+    const OLD_STORAGE_KEYS = ['fpvdrone.settings.v2', 'fpvdrone.settings.v1'];
     // Keys the game script uses for keyboard flying; forwarded as raw up/down.
     const FLIGHT_KEYS = [87, 83, 65, 68, 88, 16, 37, 38, 39, 40];
     const CHANNELS = ['throttle', 'yaw', 'pitch', 'roll', 'arm', 'mode', 'call', 'attack', 'switch'];
@@ -35,7 +35,7 @@
         rc: {
             throttle: { src: 'axis:2', invert: false }, yaw: { src: 'axis:3', invert: false },
             pitch: { src: 'axis:1', invert: false }, roll: { src: 'axis:0', invert: false },
-            arm: { src: 'axis:4', invert: false }, mode: { src: 'axis:5', invert: false },
+            arm: { src: 'axis:4', invert: false }, mode: { src: 'none', invert: false },
             call: { src: 'axis:6', invert: false }, attack: { src: 'axis:7', invert: false },
             switch: { src: 'none', invert: false }
         },
@@ -58,16 +58,17 @@
                 },
                 throttleMid: 0.5,
                 throttleExpo: 0.0,
-                thrustToWeight: 7.0,
+                thrustToWeight: 10.0,
                 massKg: 0.65,
                 cameraTiltDeg: 25,
                 angleMaxDeg: 55,
                 crashSpeed: 8.0,
-                battery: { enabled: true, cells: 4, capacityMah: 1500 }
+                battery: { enabled: true, cells: 6, capacityMah: 2200 }
             },
             camera: { eulerOrder: 'YXZ', pitchSign: -1, yawSign: -1, rollSign: -1, fovDeg: 92, modelRotSign: 1 },
-            mode: 'angle',
-            altHold: true,
+            mode: 'acro',
+            altHold: false,
+            keepControls: false,
             view: 'fpv',
             input: {
                 device: 'auto',
@@ -102,13 +103,20 @@
             if (raw) {
                 merge(d, JSON.parse(raw));
             } else {
-                // v1 -> v2: keep the pilot's mapping/rates/keys, but start on the
-                // new defaults (angle + altitude assist).
-                const old = window.localStorage.getItem(OLD_STORAGE_KEY);
-                if (old) {
+                // Older versions: keep the pilot's mapping, calibration, rates
+                // and keys, but take the new flight defaults (true acro, more
+                // power, mode switch unmapped until the pilot assigns one).
+                for (let i = 0; i < OLD_STORAGE_KEYS.length; i++) {
+                    const old = window.localStorage.getItem(OLD_STORAGE_KEYS[i]);
+                    if (!old) { continue; }
                     const o = JSON.parse(old);
                     delete o.mode; delete o.altHold;
+                    if (o.tune) { delete o.tune.thrustToWeight; delete o.tune.battery; }
+                    if (o.input && o.input.channels && o.input.channels.mode && o.input.channels.mode.src === 'axis:5') {
+                        o.input.channels.mode.src = 'none';   // was the old preset default, not the pilot's choice
+                    }
                     merge(d, o);
+                    break;
                 }
             }
         } catch (e) { /* storage unavailable */ }
@@ -124,7 +132,7 @@
     function pushSettings() {
         J.CallEvent('fpv/ui/settings', JSON.stringify({
             tune: S.tune, camera: S.camera, mode: S.mode, altHold: S.altHold, view: S.view,
-            kbStrength: S.input.kbStrength
+            kbStrength: S.input.kbStrength, keepControls: !!S.keepControls
         }));
     }
 
@@ -542,7 +550,10 @@
             'STICKS T ' + o.sticks.t.toFixed(2) + ' Y ' + o.sticks.y.toFixed(2) + ' P ' + o.sticks.p.toFixed(2) + ' R ' + o.sticks.r.toFixed(2),
             'PAD ' + (pad ? (pad.id || '?').slice(0, 40) + (padActive ? ' (active)' : ' (idle - move a stick)') : 'none') +
                 '   device ' + S.input.device,
-            'TERRAIN probe ' + (d.probeOk || 0) + '/' + (d.probeTries || 0) + '   samples ' + (d.samples || 0) +
+            'AIM RAY ' + (d.probeRatio >= 30 ? 'FOLLOWS CAMERA ' + d.probeRatio + '%' : 'NOT FOLLOWING CAMERA (' + (d.probeRatio || 0) + '%)') +
+                '   last hit ' + (d.probeDist >= 0 ? d.probeDist + 'm' : '-') + ' / ' + (d.probeOff >= 0 ? d.probeOff + ' deg off' : 'none') +
+                (d.keepControls ? '   [controls kept on]' : ''),
+            'COLLISION points ' + (d.solids || 0) + '   ground samples ' + (d.samples || 0) + '   matched hits ' + (d.probeOk || 0) +
                 '   floor ' + (d.floor !== undefined ? d.floor + 'm' : '?') + ' (' + (d.floorSrc || '?') + ')',
             'ARMED ' + o.armed + '   mode ' + o.mode + (o.altHold ? '+AH' : '') + '   motor ' + Math.round((o.motor || 0) * 100) + '%'
         ];
@@ -716,6 +727,7 @@
         $('cam-roll').checked = S.camera.rollSign === 1;
         $('cam-model').checked = S.camera.modelRotSign === -1;
         $('cam-order').value = S.camera.eulerOrder;
+        $('keep-controls').checked = !!S.keepControls;
         $('osd-ahi').checked = S.osd.ahi;
         $('osd-noise').checked = S.osd.noise;
         $('osd-sticks').checked = S.osd.sticks;
@@ -753,6 +765,7 @@
         $('cam-roll').addEventListener('change', function () { S.camera.rollSign = this.checked ? 1 : -1; changed(); });
         $('cam-model').addEventListener('change', function () { S.camera.modelRotSign = this.checked ? -1 : 1; changed(); });
         $('cam-order').addEventListener('change', function () { S.camera.eulerOrder = this.value; changed(); });
+        $('keep-controls').addEventListener('change', function () { S.keepControls = this.checked; changed(); });
         $('cam-reset').addEventListener('click', function () {
             const d = defaults().camera;
             S.camera.eulerOrder = d.eulerOrder; S.camera.pitchSign = d.pitchSign; S.camera.yawSign = d.yawSign;
@@ -929,7 +942,8 @@
             cap: 1500, batt: true, amps: 31, time: 83, noise: 0.15, probe: true,
             swarm: { n: 3, max: 5, mode: 'support', atk: 0, id: 2 }, banner: 'LINK > W2  AUTO-AIM',
             sticks: { t: 0.55, y: -0.2, p: 0.4, r: 0.15 }, src: 'keyboard', fps: 60,
-            dbg: { probeOk: 812, probeTries: 1400, samples: 655, floor: -3.2, floorSrc: 'map', pad: false } };
+            dbg: { probeOk: 812, probeTries: 1400, samples: 655, floor: -3.2, floorSrc: 'map', pad: false,
+                probeRatio: 0, probeOff: 41.7, probeDist: 12.3, solids: 0, keepControls: false } };
         S.osd.debug = /debug/.test(location.search);
         if (/menu/.test(location.search)) { setMenu(true); }
     }
