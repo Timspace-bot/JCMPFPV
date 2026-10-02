@@ -3,10 +3,11 @@
 #   powershell -ExecutionPolicy Bypass -File tools\install.ps1
 #   powershell -ExecutionPolicy Bypass -File tools\install.ps1 -ServerDir "D:\path\to\server" -NoStart
 #
-# Without -ServerDir it searches your Steam library for the JC3MP dedicated server.
+# Without -ServerDir it searches every Steam library on the PC (from Steam's
+# libraryfolders.vdf plus X:\SteamLibrary on each drive) for the JC3MP server.
 param(
     [string]$ServerDir = "",
-    [string]$SteamCommon = "B:\SteamLibrary\steamapps\common",
+    [string]$SteamCommon = "",
     [switch]$NoStart
 )
 
@@ -18,30 +19,73 @@ if (-not (Test-Path (Join-Path $source "main.js"))) {
     Write-Error "Can't find $source\main.js - run this from inside the JCMPFPV repo."
 }
 
+# Server executables, best match first: Server.exe, then anything with "server"
+# in the name (but not Steam's own helpers).
+function Find-ServerExes([string]$dir, [int]$depth) {
+    $all = Get-ChildItem -Path $dir -Filter "*.exe" -File -Recurse -Depth $depth -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match "server" -and $_.Name -notmatch "steam|crash|report" }
+    return @($all | Sort-Object @{ Expression = { if ($_.Name -ieq "Server.exe") { 0 } else { 1 } } }, @{ Expression = { $_.FullName.Length } })
+}
+
 function Find-ServerExe([string]$dir) {
-    $exe = Get-ChildItem -Path $dir -Filter "*.exe" -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match "server" } | Select-Object -First 1
-    return $exe
+    return (Find-ServerExes $dir 0 | Select-Object -First 1)
+}
+
+function Get-SteamCommonDirs {
+    $libs = New-Object System.Collections.Generic.List[string]
+    if ($SteamCommon -ne "") { $libs.Add((Split-Path -Parent (Split-Path -Parent $SteamCommon))) }
+    foreach ($key in @("HKCU:\Software\Valve\Steam", "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam")) {
+        $props = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+        foreach ($root in @($props.SteamPath, $props.InstallPath)) {
+            if (-not $root) { continue }
+            $root = $root -replace "/", "\"
+            $libs.Add($root)
+            $vdf = Join-Path $root "steamapps\libraryfolders.vdf"
+            if (Test-Path $vdf) {
+                foreach ($m in [regex]::Matches((Get-Content -Raw $vdf), '"path"\s+"([^"]+)"')) {
+                    $libs.Add(($m.Groups[1].Value -replace "\\\\", "\"))
+                }
+            }
+        }
+    }
+    foreach ($drive in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+        foreach ($sub in @("SteamLibrary", "Steam", "Program Files (x86)\Steam", "Program Files\Steam")) {
+            $libs.Add((Join-Path $drive.Root $sub))
+        }
+    }
+    $seen = @{}
+    foreach ($lib in $libs) {
+        $common = Join-Path $lib "steamapps\common"
+        $k = $common.ToLowerInvariant()
+        if ($seen.ContainsKey($k) -or -not (Test-Path $common)) { continue }
+        $seen[$k] = $true
+        $common
+    }
 }
 
 if ($ServerDir -eq "") {
-    if (-not (Test-Path $SteamCommon)) {
-        Write-Error "Steam library not found at $SteamCommon. Pass -SteamCommon or -ServerDir."
+    Write-Host "Searching your Steam libraries for the JC3MP dedicated server..."
+    $candidates = @()
+    foreach ($common in Get-SteamCommonDirs) {
+        Write-Host "  library: $common"
+        $candidates += @(Get-ChildItem -Path $common -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match "Just Cause 3" -or $_.Name -match "JC3MP" })
     }
-    Write-Host "Searching $SteamCommon for the JC3MP dedicated server..."
-    $candidates = Get-ChildItem -Path $SteamCommon -Directory |
-        Where-Object { $_.Name -match "Just Cause 3" -or $_.Name -match "JC3MP" }
+    # Dedicated-server folders first, then the multiplayer mod, then the game.
+    $candidates = $candidates | Sort-Object @{ Expression = {
+        if ($_.Name -match "Server") { 0 } elseif ($_.Name -match "Multiplayer|JC3MP") { 1 } else { 2 } } }
     foreach ($c in $candidates) {
-        # The server may sit directly in the folder or in a "server" subfolder.
-        foreach ($d in @($c.FullName, (Join-Path $c.FullName "server"))) {
-            if ((Test-Path $d) -and (Find-ServerExe $d)) { $ServerDir = $d; break }
-        }
-        if ($ServerDir -ne "") { break }
+        $exe = Find-ServerExes $c.FullName 3 | Select-Object -First 1
+        if ($exe) { $ServerDir = $exe.DirectoryName; break }
     }
     if ($ServerDir -eq "") {
         Write-Host ""
-        Write-Host "Couldn't find the dedicated server. Folders checked:"
-        $candidates | ForEach-Object { Write-Host "  $($_.FullName)" }
+        Write-Host "Couldn't find a JC3MP server executable. Folders checked:"
+        foreach ($c in $candidates) {
+            Write-Host "  $($c.FullName)"
+            Get-ChildItem -Path $c.FullName -Filter "*.exe" -File -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+                Select-Object -First 15 | ForEach-Object { Write-Host "      $($_.FullName)" }
+        }
         Write-Host ""
         Write-Host "Install 'Just Cause 3: Multiplayer Mod - Dedicated Server' from Steam (Library > Tools),"
         Write-Host "then re-run, or pass its folder with -ServerDir."
