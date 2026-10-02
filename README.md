@@ -12,7 +12,7 @@ A [JC3MP](https://just-cause.mp) package that lets you fly an FPV quadcopter in 
 The mod doesn't modify any game files. You don't need to touch `B:\SteamLibrary\steamapps\common\Just Cause 3`. JC3MP downloads client packages from the server you join.
 
 1. In Steam, install **Just Cause 3: Multiplayer Mod** and its **Dedicated Server** tool. In your library they live next to the game, under `B:\SteamLibrary\steamapps\common\`.
-2. Copy `packages/fpvdrone` from this repo into the dedicated server's `packages` folder, so you end up with `...\packages\fpvdrone\main.js`.
+2. Double-click **`install.bat`** in this repo. It finds the dedicated server under `B:\SteamLibrary\steamapps\common`, copies `packages/fpvdrone` into its `packages` folder (keeping your edited `config.js` on reinstall) and starts the server. If it can't find the server, run `tools\install.ps1 -ServerDir "<server folder>"`. To install by hand, copy `packages/fpvdrone` into the server's `packages` folder so you end up with `...\packages\fpvdrone\main.js`.
 3. Start the server, launch JC3MP and connect to it. To play solo, connect to `127.0.0.1`.
 4. Server options are in `packages/fpvdrone/config.js`. They cover the swarm size, orbit height, attack radius, damage, sea level, sync range and whether the character follows the drone.
 
